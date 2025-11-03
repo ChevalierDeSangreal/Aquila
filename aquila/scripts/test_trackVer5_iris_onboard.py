@@ -78,6 +78,11 @@ def denormalize_action(action_normalized, action_low, action_high):
     return (action_normalized + 1.0) / 2.0 * (action_high - action_low) + action_low
 
 
+def normalize_action_for_gazebo(action_network):
+    """Convert network action from [-1, 1] to Gazebo's [0, 1] range"""
+    return (action_network + 1.0) / 2.0
+
+
 def compute_hovering_thrust(mass=1.0, gravity=9.81, num_rotors=4):
     """Calculate hovering thrust per rotor"""
     return mass * gravity / num_rotors
@@ -120,17 +125,17 @@ def euler_to_rotation_matrix(euler):
     return R
 
 
-def compute_angle_between_body_z_and_target(R, quad_pos, target_pos):
-    """Compute angle between body z-axis and direction to target (degrees)"""
-    # Body z-axis in world frame (NED: body z points down)
-    body_z_world = R @ jnp.array([0.0, 0.0, 1.0])
+def compute_angle_between_body_x_and_target(R, quad_pos, target_pos):
+    """Compute angle between body x-axis and direction to target (degrees)"""
+    # Body x-axis in world frame (NED: body x points forward/机头方向)
+    body_x_world = R @ jnp.array([1.0, 0.0, 0.0])
     
     # Direction to target
     direction_to_target = target_pos - quad_pos
     direction_to_target_normalized = direction_to_target / safe_norm(direction_to_target)
     
     # Compute angle
-    cos_angle = jnp.dot(body_z_world, direction_to_target_normalized)
+    cos_angle = jnp.dot(body_x_world, direction_to_target_normalized)
     cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
     angle_rad = jnp.arccos(cos_angle)
     angle_deg = jnp.degrees(angle_rad)
@@ -172,7 +177,7 @@ async def run():
     np.random.seed(seed)
     
     # ==================== Load Policy ====================
-    policy_file = 'aquila/param/trackVer5_policy.pkl'
+    policy_file = 'aquila/param_saved/trackVer5_policy.pkl'
     
     if not os.path.exists(policy_file):
         print(f"❌ Error: Policy file not found: {policy_file}")
@@ -182,10 +187,10 @@ async def run():
     params, env_config, action_repeat, buffer_size, input_dim = load_trained_policy(policy_file)
     
     # ==================== Environment Configuration ====================
-    # From TrackEnvVer5 defaults and training config
-    dt = env_config.get('dt', 0.01)
-    max_steps = env_config.get('max_steps_in_episode', 1000)
-    target_height = env_config.get('target_height', 2.0)
+    # Test configuration (independent of training env_config)
+    dt = 0.01  # Time step in seconds
+    max_steps = 1000  # Maximum number of steps per episode
+    target_height = 10.0  # Target height in meters
     
     # Infer observation dimension from input_dim and buffer_size
     action_dim = 4  # [thrust, omega_x, omega_y, omega_z]
@@ -221,9 +226,14 @@ async def run():
     action_high = jnp.array([thrust_max * 4, omega_max, omega_max, omega_max])
     
     # Hovering action (normalized)
-    hovering_thrust_raw = mass * gravity
-    hovering_thrust_normalized = 2.0 * (hovering_thrust_raw - action_low[0]) / (action_high[0] - action_low[0]) - 1.0
-    hovering_action_normalized = jnp.array([hovering_thrust_normalized, 0.0, 0.0, 0.0])
+    # In Gazebo's [0, 1] range, hovering thrust is 0.71
+    # Convert to network's [-1, 1] range: (0.71 * 2) - 1 = 0.42
+    hovering_thrust_gazebo = 0.71  # Gazebo range [0, 1]
+    hovering_thrust_network = 2.0 * hovering_thrust_gazebo - 1.0  # Network range [-1, 1] = 0.42
+    # For angular rates, 0 (hovering) in [0, 1] corresponds to 0 in [-1, 1] (since 0 = (0 + 1) / 2 = 0.5 in [0,1] maps to -1 in [-1,1])
+    # Actually, 0 angular rate in [0, 1] would be 0.5, which maps to 0 in [-1, 1]
+    hovering_omega_network = 0.0  # Zero angular rates in [-1, 1] range
+    hovering_action_normalized = jnp.array([hovering_thrust_network, hovering_omega_network, hovering_omega_network, hovering_omega_network])
     
     # ==================== Model Setup ====================
     input_dim = buffer_size * (obs_dim + action_dim)
@@ -239,13 +249,16 @@ async def run():
     print(f"  Time step: {dt}s")
     print(f"  Max steps: {max_steps}")
     print(f"  Target height: {target_height}m")
-    print(f"  Hovering action (raw): {hovering_thrust_raw:.3f}N")
-    print(f"  Hovering action (normalized): {float(hovering_action_normalized[0]):.3f}")
+    print(f"  Hovering thrust (Gazebo [0,1]): {hovering_thrust_gazebo:.3f}")
+    print(f"  Hovering thrust (Network [-1,1]): {hovering_thrust_network:.3f}")
     print(f"{'='*60}\n")
     
     # ==================== TensorBoard Setup ====================
     run_name = f"trackVer5_sitl__{seed}__{get_time()}"
-    log_path = f"/home/core/wangzimo/Aquila/aquila/test_runs/{run_name}"
+    # Get the project root directory (two levels up from this script)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(script_dir))
+    log_path = os.path.join(project_root, "aquila", "test_runs", run_name)
     os.makedirs(log_path, exist_ok=True)
     
     writer = SummaryWriter(log_path)
@@ -290,14 +303,14 @@ async def run():
     # Start offboard mode
     target_yaw_deg = 0.0
     await drone.offboard.set_position_ned(
-        PositionNedYaw(north_m=0, east_m=0, down_m=desired_z, yaw_deg=target_yaw_deg)
+        PositionNedYaw(north_m=0, east_m=0, down_m=-10, yaw_deg=target_yaw_deg)
     )
     await drone.offboard.start()
     
     print("-- Initializing position")
-    for _ in range(40):
+    for _ in range(100):
         await drone.offboard.set_position_ned(
-            PositionNedYaw(north_m=0, east_m=0, down_m=desired_z, yaw_deg=target_yaw_deg)
+            PositionNedYaw(north_m=0, east_m=0, down_m=-10, yaw_deg=target_yaw_deg)
         )
         await asyncio.sleep(0.05)
     
@@ -350,7 +363,7 @@ async def run():
     # Initialize target position (0.5m in front, at target height)
     # In NED frame: z is negative for positions above ground
     target_pos = jnp.array([
-        quad_pos[0] + 0.5,  # 0.5m north
+        quad_pos[0] + 3,  # 0.5m north
         quad_pos[1],        # same east
         -target_height      # at target height (negative z is up)
     ])
@@ -390,7 +403,9 @@ async def run():
     
     # Initialize buffer with hovering action and current observation
     # Buffer shape should be (1, buffer_size, obs_dim + action_dim) to match training format
+    # Hovering action: thrust=0.42 (maps to 0.71 in Gazebo's [0,1]), angular rates=0.0 (zero in [-1,1])
     action_obs_combined = jnp.concatenate([hovering_action_normalized, obs_normalized])
+    # Fill entire buffer with the same hovering action + observation (all timesteps start with hover)
     action_obs_buffer = jnp.tile(action_obs_combined[None, None, :], (1, buffer_size, 1))
     
     # Get initial action
@@ -414,7 +429,9 @@ async def run():
             # Create temporary buffer for getting new action
             # Buffer shape is (1, buffer_size, obs_dim + action_dim), roll on axis=1
             action_obs_buffer_for_input = jnp.roll(action_obs_buffer, shift=-1, axis=1)
-            empty_action = jnp.zeros(action_dim)
+            # Use zero action (0.0 in [-1, 1] range) as placeholder for current timestep
+            # This will be replaced by the network's output action
+            empty_action = jnp.zeros(action_dim)  # [0, 0, 0, 0] in [-1, 1] range
             action_obs_combined_empty = jnp.concatenate([empty_action, obs_normalized])
             # Set the last element in the buffer (along axis=1)
             action_obs_buffer_for_input = action_obs_buffer_for_input.at[0, -1, :].set(action_obs_combined_empty)
@@ -434,18 +451,15 @@ async def run():
             action_counter += 1
             
         # ==================== Convert Action to MAVLink Command ====================
-        # Denormalize action
-        action_denormalized = denormalize_action(current_action, action_low, action_high)
+        # Network outputs actions in [-1, 1] range
+        # Convert thrust from [-1, 1] to Gazebo's [0, 1] range
+        thrust_network = float(current_action[0])
+        thrust_gazebo = normalize_action_for_gazebo(jnp.array([thrust_network]))[0]
+        thrust_normalized = float(np.clip(thrust_gazebo, 0.0, 1.0))
         
-        # Extract thrust and angular rates
-        total_thrust = float(action_denormalized[0])
-        omega_cmd = np.array(action_denormalized[1:])
-        
-        # Convert to PX4 commands
-        # PX4 expects collective thrust normalized [0, 1]
-        # We map our thrust to [0, 1] range where 0.5 is approximately hovering
-        thrust_normalized = total_thrust / (mass * gravity * 2.0)
-        thrust_normalized = np.clip(thrust_normalized, 0.0, 1.0)
+        # Angular rates: denormalize from [-1, 1] to actual rad/s range
+        omega_network = np.array([current_action[1], current_action[2], current_action[3]])
+        omega_cmd = denormalize_action(omega_network, -omega_max, omega_max)
         
         # Angular rates in rad/s (convert to deg/s for MAVLink)
         roll_rate_deg = omega_cmd[0] * 180.0 / np.pi
@@ -522,7 +536,7 @@ async def run():
         height = float(-quad_pos[2])  # NED: negative z is up
         speed = float(safe_norm(quad_vel))
         
-        angle_to_target = float(compute_angle_between_body_z_and_target(
+        angle_to_target = float(compute_angle_between_body_x_and_target(
             quad_R, quad_pos, target_pos
         ))
             
@@ -585,7 +599,7 @@ async def run():
         if distance > 100.0:
             print(f"\n❌ Episode terminated: distance too large ({distance:.1f}m)")
             break
-        if height < 0.1 or height > 10.0:
+        if height < 0.1 or height > 20.0:
             print(f"\n❌ Episode terminated: height out of bounds ({height:.1f}m)")
             break
     

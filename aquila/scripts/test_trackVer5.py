@@ -60,17 +60,17 @@ def safe_norm(x, eps=1e-8):
     return jnp.sqrt(jnp.sum(x * x) + eps)
 
 
-def compute_angle_between_body_z_and_target(quad_R, quad_pos, target_pos):
-    """计算无人机z轴与到目标物体方向的夹角（度数）"""
-    # 机体z轴在世界坐标系中的方向（NED坐标系中，机体z轴向下）
-    body_z_world = quad_R @ jnp.array([0.0, 0.0, 1.0])
+def compute_angle_between_body_x_and_target(quad_R, quad_pos, target_pos):
+    """计算无人机x轴与到目标物体方向的夹角（度数）"""
+    # 机体x轴在世界坐标系中的方向（NED坐标系中，机体x轴向前）
+    body_x_world = quad_R @ jnp.array([1.0, 0.0, 0.0])
     
     # 从无人机到目标的方向向量
     direction_to_target = target_pos - quad_pos
     direction_to_target_normalized = direction_to_target / safe_norm(direction_to_target)
     
     # 计算夹角的余弦值
-    cos_angle = jnp.dot(body_z_world, direction_to_target_normalized)
+    cos_angle = jnp.dot(body_x_world, direction_to_target_normalized)
     cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
     
     # 转换为角度
@@ -80,7 +80,7 @@ def compute_angle_between_body_z_and_target(quad_R, quad_pos, target_pos):
     return angle_deg
 
 
-def run_episode(env, policy, params, buffer_size, action_repeat, max_steps=1000, key=None):
+def run_episode(env, policy, params, buffer_size, action_repeat, max_steps=2000, key=None):
     """运行一个episode并记录数据"""
     if key is None:
         key = jax.random.key(42)
@@ -102,7 +102,7 @@ def run_episode(env, policy, params, buffer_size, action_repeat, max_steps=1000,
         'reward': [],
         'distance': [],
         'height': [],
-        'angle_body_z_target': [],
+        'angle_body_x_target': [],
     }
     
     # 初始化动作-状态缓冲区（与bptt.py训练代码保持一致）
@@ -183,13 +183,13 @@ def run_episode(env, policy, params, buffer_size, action_repeat, max_steps=1000,
         height = float(-state.quadrotor_state.p[2])
         data['height'].append(height)
         
-        # 计算机体z轴与到目标方向的夹角
-        angle = float(compute_angle_between_body_z_and_target(
+        # 计算机体x轴与到目标方向的夹角
+        angle = float(compute_angle_between_body_x_and_target(
             state.quadrotor_state.R, 
             state.quadrotor_state.p, 
             state.target_pos
         ))
-        data['angle_body_z_target'].append(angle)
+        data['angle_body_x_target'].append(angle)
         
         # 每action_repeat步获取一次新动作（与bptt.py训练代码逻辑一致）
         if action_counter % action_repeat == 0:
@@ -240,12 +240,12 @@ def run_episode(env, policy, params, buffer_size, action_repeat, max_steps=1000,
     data['distance'].append(distance)
     height = float(-state.quadrotor_state.p[2])
     data['height'].append(height)
-    angle = float(compute_angle_between_body_z_and_target(
+    angle = float(compute_angle_between_body_x_and_target(
         state.quadrotor_state.R, 
         state.quadrotor_state.p, 
         state.target_pos
     ))
-    data['angle_body_z_target'].append(angle)
+    data['angle_body_x_target'].append(angle)
     # 不记录最后的reward，因为没有执行新的动作
     
     print(f"\n{'='*60}")
@@ -323,7 +323,7 @@ def visualize_data(data, output_dir):
     actions = np.array(data['action'][:-1])
     height = np.array(data['height'][:-1])
     reward = np.array(data['reward'])
-    angle = np.array(data['angle_body_z_target'][:-1])
+    angle = np.array(data['angle_body_x_target'][:-1])
     distance = np.array(data['distance'][:-1])
     
     fig = plt.figure(figsize=(16, 12))
@@ -360,14 +360,14 @@ def visualize_data(data, output_dir):
     ax3.legend(fontsize=9, ncol=4, loc='upper right')
     ax3.grid(True, alpha=0.3)
     
-    # 子图4: 无人机z轴与到目标物体方向夹角随时间变化
+    # 子图4: 无人机x轴与到目标物体方向夹角随时间变化
     ax4 = fig.add_subplot(gs[2, 0])
     ax4.plot(time, angle, 'purple', linewidth=2)
     ax4.axhline(y=90, color='r', linestyle='--', linewidth=1, alpha=0.7, 
                 label='Perpendicular (90°)')
     ax4.set_xlabel('Time [s]', fontsize=11)
     ax4.set_ylabel('Angle [degrees]', fontsize=11)
-    ax4.set_title('Body Z-axis to Target Angle vs Time', fontsize=12, fontweight='bold')
+    ax4.set_title('Body X-axis to Target Angle vs Time', fontsize=12, fontweight='bold')
     ax4.legend(fontsize=9)
     ax4.grid(True, alpha=0.3)
     
@@ -396,7 +396,7 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Load Policy ====================
-    policy_file = 'aquila/param/trackVer5_policy.pkl'
+    policy_file = 'aquila/param_saved/trackVer5_policy.pkl'
     
     if not os.path.exists(policy_file):
         print(f"❌ 错误: 找不到训练好的模型文件: {policy_file}")
@@ -408,7 +408,7 @@ def main():
     # ==================== Environment Setup ====================
     # 使用与训练相同的环境配置
     env = TrackEnvVer5(
-        max_steps_in_episode=env_config.get('max_steps_in_episode', 1000),
+        max_steps_in_episode=2000,
         dt=env_config.get('dt', 0.01),
         delay=env_config.get('delay', 0.03),
         omega_std=0.1,
@@ -422,8 +422,8 @@ def main():
         target_speed_max=env_config.get('target_speed_max', 1.0),
         reset_distance=env_config.get('reset_distance', 100.0),
         max_speed=env_config.get('max_speed', 20.0),
-        thrust_to_weight_min=1.5,
-        thrust_to_weight_max=3.0,
+        thrust_to_weight_min=1.4,
+        thrust_to_weight_max=1.4,
     )
     
     # 应用相同的wrapper
