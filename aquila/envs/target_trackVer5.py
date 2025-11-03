@@ -44,6 +44,7 @@ class TrackStateVer5:
     last_actions: jax.Array
     target_pos: jax.Array
     target_vel: jax.Array
+    target_direction: jax.Array  # 目标速度方向（单位向量，用于随机方向运动）
     quad_params: ExtendedQuadrotorParams  # 添加quadrotor参数（扩展版，包含mass和gravity）
     action_raw: jax.Array = field_jnp(jnp.zeros(4))
     filtered_acc: jax.Array = field_jnp([0.0, 0.0, 9.8])
@@ -85,7 +86,7 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
     def __init__(
         self,
         *,
-        max_steps_in_episode=10000,
+        max_steps_in_episode=1000,
         dt=0.01,
         delay=0.03,
         omega_std=0.1,
@@ -97,9 +98,10 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
         obs_tau_R=0.02,
         # Tracking specific parameters
         target_height=2.0,  # m (height above ground, positive value)
-        target_init_distance_min=1.0,  # m (x轴上的初始距离最小值)
-        target_init_distance_max=5.0,  # m (x轴上的初始距离最大值)
+        target_init_distance_min=0.5,  # m (x轴上的初始距离最小值)
+        target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
         target_speed_max=1.0,  # m/s (目标最大速度)
+        target_acceleration=0.5,  # m/s² (目标加速度，从0加速到最大速度)
         reset_distance=100.0,  # m (重置距离阈值)
         max_speed=20.0,  # m/s
         # Parameter randomization (quadrotor)
@@ -151,6 +153,7 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
         self.target_init_distance_min = target_init_distance_min
         self.target_init_distance_max = target_init_distance_max
         self.target_speed_max = target_speed_max
+        self.target_acceleration = target_acceleration
         self.reset_distance = reset_distance
         
         # Parameter randomization
@@ -170,8 +173,8 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
             return state, self._get_obs(state)
         
         # 分割随机数key
-        keys = jax.random.split(key, 6)
-        key_target_pos, key_target_vel, key_yaw, key_omega, key_quad, key_randomize = keys
+        keys = jax.random.split(key, 7)
+        key_target_pos, key_target_vel, key_target_dir, key_yaw, key_omega, key_quad, key_randomize = keys
         
         # 获取quadrotor参数（如果没有提供则使用默认参数）
         if quad_params is None:
@@ -207,13 +210,13 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
         # y=0, z=-2m (NED坐标系，高度2m在天上所以是-2)
         target_pos = jnp.array([target_x, 0.0, -self.target_height])
         
-        # 0～1m/s的匀速直线运动（沿x轴）
-        target_speed = jax.random.uniform(
-            key_target_vel, shape=(), 
-            minval=0.0, 
-            maxval=self.target_speed_max
-        )
-        target_vel = jnp.array([target_speed, 0.0, 0.0])
+        # 随机生成速度方向（单位向量，限制在水平面xy上）
+        # 生成一个随机角度（0到2π），然后在xy平面上生成单位向量
+        random_angle = jax.random.uniform(key_target_dir, shape=(), minval=0.0, maxval=2.0 * jnp.pi)
+        target_direction = jnp.array([jnp.cos(random_angle), jnp.sin(random_angle), 0.0])
+        
+        # 初始速度为0，将加速到目标最大速度（沿随机方向）
+        target_vel = jnp.array([0.0, 0.0, 0.0])
         
         # ========== 无人机初始化 ==========
         # 位置在原点，高度为2m（NED坐标系中z=-2）
@@ -272,6 +275,7 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
             last_actions=last_actions,
             target_pos=target_pos,
             target_vel=target_vel,
+            target_direction=target_direction,
             quad_params=quad_params,
             action_raw=action_raw,
             filtered_acc=filtered_acc,
@@ -407,9 +411,20 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
         # 观测：姿态一拍延时（一步delay）
         obs_R_new = state.quadrotor_state.R
 
-        # 目标物体匀速直线运动
-        target_pos = state.target_pos + state.target_vel * self.dt
-        target_vel = state.target_vel  # 匀速运动，速度不变
+        # 目标物体加速运动（从0加速到最大速度，沿随机方向）
+        current_speed_vec = state.target_vel
+        current_speed = safe_norm(current_speed_vec, eps=1e-8)
+        target_speed_max = self.target_speed_max
+        target_acc = self.target_acceleration
+        
+        # 如果当前速度小于最大速度，则加速
+        new_speed = jnp.minimum(
+            current_speed + target_acc * self.dt,
+            target_speed_max
+        )
+        # 速度向量 = 速度大小 * 方向单位向量
+        target_vel = new_speed * state.target_direction
+        target_pos = state.target_pos + target_vel * self.dt
         
         # 检查距离是否超过10m，更新标志位
         distance_to_target = safe_norm(quadrotor_state.p - target_pos, eps=1e-8)
@@ -430,6 +445,7 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
             obs_R=obs_R_new,
             target_pos=target_pos,
             target_vel=target_vel,
+            target_direction=state.target_direction,  # 保持方向不变
             has_exceeded_distance=has_exceeded_distance,
         )
 
@@ -498,7 +514,7 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
         
         # 2. 距离损失 (distance) - 水平距离与目标距离的绝对差值
         norm_hor_dis = safe_norm(p_rel[:2], eps=1e-8)
-        target_distance = 3.0  # 目标距离3米
+        target_distance = 1.0  # 目标距离1米
         distance_loss = jnp.abs(norm_hor_dis - target_distance)
         
         # 3. 高度损失 (h) - 无人机高度与目标高度的绝对差值

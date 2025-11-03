@@ -75,8 +75,8 @@ def main():
         obs_tau_R=0.02,
         # Tracking specific parameters
         target_height=2.0,  # m (高度2米)
-        target_init_distance_min=1.0,  # m (x轴上的初始距离最小值)
-        target_init_distance_max=5.0,  # m (x轴上的初始距离最大值)
+        target_init_distance_min=0.5,  # m (x轴上的初始距离最小值)
+        target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
         target_speed_max=1.0,  # m/s (目标最大速度)
         reset_distance=100.0,  # m (重置距离阈值)
         max_speed=20.0,  # m/s

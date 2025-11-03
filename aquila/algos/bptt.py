@@ -107,20 +107,49 @@ def train(
             env_state, obs = env.reset(key_reset, None)
             
             # Ver3修改：初始化动作、计数器和动作-状态缓冲区
-            # 获取观测维度和动作维度
             obs_dim = obs.shape[1]
-            action_dim = 4  # 假设动作维度为4 [thrust, wx, wy, wz]
+            action_dim = 4
             
-            # 获取悬停动作
-            original_env = env.envs[0] if hasattr(env, 'envs') else env
-            if hasattr(original_env, 'hovering_action'):
-                hovering_action = original_env.hovering_action
+            # 获取原始环境并归一化悬停动作
+            # ⚠️ 修复：使用每个环境实际的thrust_max和omega_max（参数随机化后的值），而不是默认值
+            original_env = env.unwrapped
+            hovering_action_raw = original_env.hovering_action
+            
+            # 从env_state中获取每个环境实际的quad_params（支持参数随机化）
+            # env_state是LogEnvState，包含env_state字段，由于VecEnv，env_state是向量化的TrackStateVer5
+            actual_states = env_state.env_state  # 形状: (num_envs, ...)
+            actual_thrust_max = actual_states.quad_params.thrust_max  # 形状: (num_envs,)
+            actual_omega_max = actual_states.quad_params.omega_max  # 形状: (num_envs, 3) 或 (num_envs,) 取决于定义
+            
+            # 确保维度正确
+            if actual_omega_max.ndim == 2:
+                # 如果omega_max是每个轴的，取第一个轴的值用于归一化
+                actual_omega_max_scalar = actual_omega_max[:, 0]
             else:
-                hovering_action = jnp.array([9.8, 0.0, 0.0, 0.0])
+                actual_omega_max_scalar = actual_omega_max
             
-            # 初始化动作-状态缓冲区，用初始状态和悬停动作填满整个缓冲区
-            hovering_action_expanded = jnp.tile(hovering_action[None, :], (num_envs, 1))
-            action_obs_combined = jnp.concatenate([hovering_action_expanded, obs], axis=1)
+            # 为每个环境分别计算归一化的悬停动作
+            # hovering_action_raw是标量（所有环境相同），但thrust_max和omega_max是向量化的
+            action_low_thrust = original_env.thrust_min * 4  # 标量，所有环境相同
+            action_high_thrust = actual_thrust_max * 4  # 形状: (num_envs,)
+            action_low_omega = -actual_omega_max_scalar  # 形状: (num_envs,)
+            action_high_omega = actual_omega_max_scalar  # 形状: (num_envs,)
+            
+            # 归一化悬停动作的推力分量
+            hovering_thrust_raw = hovering_action_raw[0]  # 标量
+            hovering_thrust_normalized = 2.0 * (hovering_thrust_raw - action_low_thrust) / (action_high_thrust - action_low_thrust) - 1.0
+            # 归一化悬停动作的角速度分量（都是0）
+            hovering_omega_normalized = jnp.zeros((num_envs, 3))
+            
+            # 组合归一化的悬停动作
+            hovering_action_normalized = jnp.concatenate([
+                hovering_thrust_normalized[:, None],  # (num_envs, 1)
+                hovering_omega_normalized  # (num_envs, 3)
+            ], axis=1)  # 形状: (num_envs, 4)
+            
+            # 初始化缓冲区，使用归一化的悬停动作
+            # hovering_action_normalized已经是(num_envs, 4)形状，不需要tile
+            action_obs_combined = jnp.concatenate([hovering_action_normalized, obs], axis=1)
             action_obs_buffer_init = jnp.tile(action_obs_combined[:, None, :], (1, buffer_size_k, 1))
             
             # 在epoch开始时获取第一个动作（使用填充的缓冲区）
@@ -274,23 +303,40 @@ def train(
     env_state, obs = env.reset(key_reset, None)
     
     # Ver3修改：初始化RunnerState时需要包含动作-状态缓冲区
-    # 获取观测维度和动作维度
     obs_dim = obs.shape[1]
-    action_dim = 4  # 假设动作维度为4 [thrust, wx, wy, wz]
+    action_dim = 4
     
-    # 初始化动作-状态缓冲区，状态用当前状态填充，动作用悬停动作填充
-    # 获取悬停动作 - 从原始环境获取
-    original_env = env.envs[0] if hasattr(env, 'envs') else env
-    if hasattr(original_env, 'hovering_action'):
-        hovering_action = original_env.hovering_action
+    # 获取原始环境并归一化悬停动作
+    # ⚠️ 修复：使用每个环境实际的thrust_max和omega_max（参数随机化后的值），而不是默认值
+    original_env = env.unwrapped
+    hovering_action_raw = original_env.hovering_action
+    
+    # 从env_state中获取每个环境实际的quad_params（支持参数随机化）
+    actual_states = env_state.env_state  # 形状: (num_envs, ...)
+    actual_thrust_max = actual_states.quad_params.thrust_max  # 形状: (num_envs,)
+    actual_omega_max = actual_states.quad_params.omega_max  # 形状: (num_envs, 3) 或 (num_envs,)
+    
+    # 确保维度正确
+    if actual_omega_max.ndim == 2:
+        actual_omega_max_scalar = actual_omega_max[:, 0]
     else:
-        # 默认悬停动作
-        hovering_action = jnp.array([9.8, 0.0, 0.0, 0.0])
+        actual_omega_max_scalar = actual_omega_max
+    
+    # 为每个环境分别计算归一化的悬停动作
+    action_low_thrust = original_env.thrust_min * 4
+    action_high_thrust = actual_thrust_max * 4  # 形状: (num_envs,)
+    
+    hovering_thrust_raw = hovering_action_raw[0]
+    hovering_thrust_normalized = 2.0 * (hovering_thrust_raw - action_low_thrust) / (action_high_thrust - action_low_thrust) - 1.0
+    hovering_omega_normalized = jnp.zeros((num_envs, 3))
+    
+    hovering_action_normalized = jnp.concatenate([
+        hovering_thrust_normalized[:, None],
+        hovering_omega_normalized
+    ], axis=1)  # 形状: (num_envs, 4)
     
     # 创建初始的动作-状态组合：[action, obs]
-    # 确保动作和观测的维度正确
-    hovering_action_expanded = jnp.tile(hovering_action[None, :], (num_envs, 1))
-    action_obs_combined = jnp.concatenate([hovering_action_expanded, obs], axis=1)
+    action_obs_combined = jnp.concatenate([hovering_action_normalized, obs], axis=1)
     
     # 初始化缓冲区，用悬停动作和当前观测填充
     action_obs_buffer_init = jnp.tile(action_obs_combined[:, None, :], (1, buffer_size, 1))
@@ -364,18 +410,37 @@ def train_multi_gpu(
             
             # Ver3修改：初始化动作、计数器和动作-状态缓冲区
             obs_dim = obs.shape[1]
-            action_dim = 4  # 假设动作维度为4 [thrust, wx, wy, wz]
+            action_dim = 4
             
-            # 获取悬停动作
-            original_env = env.envs[0] if hasattr(env, 'envs') else env
-            if hasattr(original_env, 'hovering_action'):
-                hovering_action = original_env.hovering_action
+            # 获取原始环境并归一化悬停动作
+            # ⚠️ 修复：使用每个环境实际的thrust_max和omega_max（参数随机化后的值），而不是默认值
+            original_env = env.unwrapped
+            hovering_action_raw = original_env.hovering_action
+            
+            # 从env_state中获取每个环境实际的quad_params（支持参数随机化）
+            actual_states = env_state.env_state
+            actual_thrust_max = actual_states.quad_params.thrust_max
+            actual_omega_max = actual_states.quad_params.omega_max
+            
+            if actual_omega_max.ndim == 2:
+                actual_omega_max_scalar = actual_omega_max[:, 0]
             else:
-                hovering_action = jnp.array([9.8, 0.0, 0.0, 0.0])
+                actual_omega_max_scalar = actual_omega_max
             
-            # 初始化动作-状态缓冲区，用初始状态和悬停动作填满整个缓冲区
-            hovering_action_expanded = jnp.tile(hovering_action[None, :], (num_envs_per_device, 1))
-            action_obs_combined = jnp.concatenate([hovering_action_expanded, obs], axis=1)
+            action_low_thrust = original_env.thrust_min * 4
+            action_high_thrust = actual_thrust_max * 4
+            
+            hovering_thrust_raw = hovering_action_raw[0]
+            hovering_thrust_normalized = 2.0 * (hovering_thrust_raw - action_low_thrust) / (action_high_thrust - action_low_thrust) - 1.0
+            hovering_omega_normalized = jnp.zeros((num_envs_per_device, 3))
+            
+            hovering_action_normalized = jnp.concatenate([
+                hovering_thrust_normalized[:, None],
+                hovering_omega_normalized
+            ], axis=1)
+            
+            # 初始化缓冲区，使用归一化的悬停动作
+            action_obs_combined = jnp.concatenate([hovering_action_normalized, obs], axis=1)
             action_obs_buffer_init = jnp.tile(action_obs_combined[:, None, :], (1, buffer_size_k, 1))
             
             # 在epoch开始时获取第一个动作（使用填充的缓冲区）
@@ -532,18 +597,37 @@ def train_multi_gpu(
         
         # Ver3修改：初始化动作、计数器和动作-状态缓冲区
         obs_dim = obs.shape[1]
-        action_dim = 4  # 假设动作维度为4 [thrust, wx, wy, wz]
+        action_dim = 4
         
-        # 获取悬停动作
-        original_env = env.envs[0] if hasattr(env, 'envs') else env
-        if hasattr(original_env, 'hovering_action'):
-            hovering_action = original_env.hovering_action
+        # 获取原始环境并归一化悬停动作
+        # ⚠️ 修复：使用每个环境实际的thrust_max和omega_max（参数随机化后的值），而不是默认值
+        original_env = env.unwrapped
+        hovering_action_raw = original_env.hovering_action
+        
+        # 从env_state中获取每个环境实际的quad_params（支持参数随机化）
+        actual_states = env_state.env_state
+        actual_thrust_max = actual_states.quad_params.thrust_max
+        actual_omega_max = actual_states.quad_params.omega_max
+        
+        if actual_omega_max.ndim == 2:
+            actual_omega_max_scalar = actual_omega_max[:, 0]
         else:
-            hovering_action = jnp.array([9.8, 0.0, 0.0, 0.0])
+            actual_omega_max_scalar = actual_omega_max
         
-        # 初始化动作-状态缓冲区，用初始状态和悬停动作填满整个缓冲区
-        hovering_action_expanded = jnp.tile(hovering_action[None, :], (num_envs_per_device, 1))
-        action_obs_combined = jnp.concatenate([hovering_action_expanded, obs], axis=1)
+        action_low_thrust = original_env.thrust_min * 4
+        action_high_thrust = actual_thrust_max * 4
+        
+        hovering_thrust_raw = hovering_action_raw[0]
+        hovering_thrust_normalized = 2.0 * (hovering_thrust_raw - action_low_thrust) / (action_high_thrust - action_low_thrust) - 1.0
+        hovering_omega_normalized = jnp.zeros((num_envs_per_device, 3))
+        
+        hovering_action_normalized = jnp.concatenate([
+            hovering_thrust_normalized[:, None],
+            hovering_omega_normalized
+        ], axis=1)
+        
+        # 初始化缓冲区，使用归一化的悬停动作
+        action_obs_combined = jnp.concatenate([hovering_action_normalized, obs], axis=1)
         action_obs_buffer_init = jnp.tile(action_obs_combined[:, None, :], (1, buffer_size, 1))
         
         # 获取初始动作（使用填充的缓冲区）

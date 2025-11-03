@@ -4,11 +4,14 @@ __pycache__/
 *$py.class
 
 # temporary parameters
-/aquila/param/
+/aquila/param/*
+
+# nohup.out
+*nohup.out
 
 # temporary output
-/aquila/runs/
-/aquila/output/
+*runs/*
+*output/*
 
 # C extensions
 *.so
