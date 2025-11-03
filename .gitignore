@@ -3,6 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# temporary parameters
+/aquila/param/
+
+# temporary output
+/aquila/runs/
+/aquila/output/
+
 # C extensions
 *.so
 
