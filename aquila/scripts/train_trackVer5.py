@@ -105,7 +105,7 @@ def main():
     print(f"Input dimension (buffer_size * (obs_dim + action_dim)): {input_dim}")
     
     # ==================== Training Parameters ====================
-    num_epochs = 2000  # 训练轮数
+    num_epochs = 4000  # 训练轮数
     num_envs = 512 # 并行环境数（单卡）
     
     # 动作重复参数

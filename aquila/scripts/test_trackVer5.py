@@ -111,6 +111,7 @@ def run_episode(env, policy, params, buffer_size, action_repeat, max_steps=2000,
     
     # 获取原始环境并归一化悬停动作
     # ⚠️ 修复：使用该episode实际的thrust_max和omega_max（参数随机化后的值），而不是默认值
+    # 访问被wrapper包装的环境：env -> NormalizeActionWrapper -> MinMaxObservationWrapper -> TrackEnvVer5
     original_env = env._env._env
     hovering_action_raw = original_env.hovering_action
     
@@ -119,26 +120,30 @@ def run_episode(env, policy, params, buffer_size, action_repeat, max_steps=2000,
     actual_thrust_max = state.quad_params.thrust_max
     actual_omega_max = state.quad_params.omega_max
     
-    # 确保omega_max维度正确
-    # omega_max在QuadrotorParams中是长度为3的数组，取第一个值用于归一化
-    if actual_omega_max.ndim > 0:
-        actual_omega_max_scalar = actual_omega_max[0] if len(actual_omega_max) > 0 else actual_omega_max
+    # 确保omega_max维度正确（与bptt.py中的处理方式一致）
+    # omega_max在QuadrotorParams中是长度为3的数组
+    if actual_omega_max.ndim == 2:
+        # 如果是(num_envs, 3)形状，取第一个轴的值
+        actual_omega_max_scalar = actual_omega_max[:, 0]
     else:
-        actual_omega_max_scalar = actual_omega_max
+        # 如果是(3,)形状，取第一个元素
+        actual_omega_max_scalar = actual_omega_max if actual_omega_max.ndim == 0 else actual_omega_max[0]
     
-    # 计算归一化范围
+    # 计算归一化范围（与bptt.py完全一致）
     action_low_thrust = original_env.thrust_min * 4
     action_high_thrust = actual_thrust_max * 4
     
-    # 归一化悬停动作
+    # 归一化悬停动作（与bptt.py公式完全一致）
     hovering_thrust_raw = hovering_action_raw[0]
     hovering_thrust_normalized = 2.0 * (hovering_thrust_raw - action_low_thrust) / (action_high_thrust - action_low_thrust) - 1.0
     hovering_omega_normalized = jnp.zeros(3)  # 角速度分量为0
     
+    # 组合归一化的悬停动作 (单环境版本，无batch维度)
+    # hovering_thrust_normalized是标量，需要扩展为(1,)形状
     hovering_action_normalized = jnp.concatenate([
-        jnp.array([hovering_thrust_normalized]),
-        hovering_omega_normalized
-    ])
+        jnp.array([hovering_thrust_normalized]),  # (1,)
+        hovering_omega_normalized  # (3,)
+    ])  # 形状: (4,)
     
     # 创建初始的动作-状态组合缓冲区（使用归一化的悬停动作）
     action_obs_combined = jnp.concatenate([hovering_action_normalized, obs])
@@ -396,7 +401,7 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Load Policy ====================
-    policy_file = 'aquila/param_saved/trackVer5_policy.pkl'
+    policy_file = 'aquila/param/trackVer5_policy.pkl'
     
     if not os.path.exists(policy_file):
         print(f"❌ 错误: 找不到训练好的模型文件: {policy_file}")
@@ -408,22 +413,25 @@ def main():
     # ==================== Environment Setup ====================
     # 使用与训练相同的环境配置
     env = TrackEnvVer5(
-        max_steps_in_episode=2000,
-        dt=env_config.get('dt', 0.01),
-        delay=env_config.get('delay', 0.03),
+        max_steps_in_episode=1000,  # 追踪任务的最大步数
+        dt=0.01,  # 使用完整四旋翼的默认时间步长
+        delay=0.03,
         omega_std=0.1,
-        action_penalty_weight=env_config.get('action_penalty_weight', 0.5),
-        obs_tau_pos=env_config.get('obs_tau_pos', 0.3),
-        obs_tau_vel=env_config.get('obs_tau_vel', 0.2),
-        obs_tau_R=env_config.get('obs_tau_R', 0.02),
-        target_height=env_config.get('target_height', 2.0),
-        target_init_distance_min=env_config.get('target_init_distance_min', 0.5),
-        target_init_distance_max=env_config.get('target_init_distance_max', 1.5),
-        target_speed_max=env_config.get('target_speed_max', 1.0),
-        reset_distance=env_config.get('reset_distance', 100.0),
-        max_speed=env_config.get('max_speed', 20.0),
-        thrust_to_weight_min=1.4,
-        thrust_to_weight_max=1.4,
+        action_penalty_weight=0.5,
+        # Observation dynamics time constants
+        obs_tau_pos=0.3,
+        obs_tau_vel=0.2,
+        obs_tau_R=0.02,
+        # Tracking specific parameters
+        target_height=2.0,  # m (高度2米)
+        target_init_distance_min=0.5,  # m (x轴上的初始距离最小值)
+        target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
+        target_speed_max=1.0,  # m/s (目标最大速度)
+        reset_distance=100.0,  # m (重置距离阈值)
+        max_speed=20.0,  # m/s
+        # Parameter randomization (quadrotor)
+        thrust_to_weight_min=1.5,  # 最小推重比
+        thrust_to_weight_max=3.0,  # 最大推重比
     )
     
     # 应用相同的wrapper

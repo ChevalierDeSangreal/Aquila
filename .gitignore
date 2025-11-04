@@ -11,6 +11,7 @@ __pycache__/
 
 # temporary output
 *runs/*
+runs/*
 *output/*
 
 # C extensions

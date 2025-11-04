@@ -550,8 +550,8 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
             1 * velocity_loss + 
             50 * direction_loss + 
             100 * height_loss + 
-            0 * action_loss +
-            0 * omega_loss  # 新增：惩罚角速度防止持续旋转
+            1 * action_loss +
+            1 * omega_loss  # 新增：惩罚角速度防止持续旋转
         )
         
         # 转换为奖励（负的损失）

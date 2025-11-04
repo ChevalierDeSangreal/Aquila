@@ -92,7 +92,7 @@ class Quadrotor:
             motor_omega_max=7000.0,  # [rad/s]
             motor_tau=0.04,  # [s]
             motor_inertia=2.6e-7,  # [kgm^2]
-            omega_max=jnp.array([5.0, 5.0, 5.0]),  # [rad/s]
+            omega_max=jnp.array([0.5, 0.5, 0.5]),  # [rad/s]
             thrust_map=jnp.array([2e-7, 0.0,  0.0]),
             kappa=0.008,  # [Nm/N]
             thrust_min=0.0,  # [N]
@@ -412,8 +412,8 @@ class Quadrotor:
             QuadrotorParams with randomized values:
             - mass: fixed (not randomized)
             - thrust_max: randomized based on thrust-to-weight ratio range
-            - omega_max: randomized with ±40% variation around base value
-            - motor_tau: randomized with ±10% variation around base value
+            - omega_max: randomized with ±30% variation around 0.5 rad/s
+            - motor_tau: randomized with ±30% variation around base value
         """
         key_thrust, key_omega, key_tau = jax.random.split(key, 3)
         
@@ -427,13 +427,13 @@ class Quadrotor:
         )
         thrust_max = (thrust_to_weight_ratio * mass * 9.81) / 4.0
         
-        # Randomize maximum angular velocity: ±40% variation around base value
-        # For each axis, multiply by a factor between 0.6 and 1.4
-        omega_multiplier = jax.random.uniform(key_omega, shape=(3,), minval=0.6, maxval=1.4)
-        omega_max = base_params.omega_max * omega_multiplier
+        # Randomize maximum angular velocity: ±30% variation around 0.5 rad/s
+        # For each axis, omega_max in range [0.35, 0.65] rad/s
+        omega_base = 0.5  # rad/s
+        omega_max = jax.random.uniform(key_omega, shape=(3,), minval=omega_base * 0.7, maxval=omega_base * 1.3)
         
-        # Randomize motor_tau: ±10% fluctuation around the base value
-        tau_multiplier = jax.random.uniform(key_tau, minval=0.9, maxval=1.1)
+        # Randomize motor_tau: ±30% fluctuation around the base value
+        tau_multiplier = jax.random.uniform(key_tau, minval=0.7, maxval=1.3)
         motor_tau = base_params.motor_tau * tau_multiplier
         
         return QuadrotorParams(
