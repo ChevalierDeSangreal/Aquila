@@ -112,7 +112,7 @@ def main():
     action_repeat = 10  # 每10个step才获取一次新动作
     
     # Optimizer - 使用余弦衰减学习率
-    initial_learning_rate = 1e-3
+    initial_learning_rate = 5e-3
     end_learning_rate = 5e-4
     scheduler = optax.cosine_decay_schedule(
         init_value=initial_learning_rate,

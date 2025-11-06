@@ -36,6 +36,9 @@ class QuadrotorState(CustomPyTree):
     acc: jax.Array = field_jnp([0.0, 0.0, 0.0])
     dr_key: chex.PRNGKey = field_jnp(jax.random.key(0))
     fix_key: chex.PRNGKey = field_jnp(jax.random.key(0))
+    # PID控制状态
+    omega_err_integral: jax.Array = field_jnp([0.0, 0.0, 0.0])  # 积分项
+    last_omega_err: jax.Array = field_jnp([0.0, 0.0, 0.0])  # 上次误差（用于微分项）
 
     def detached(self):
         return QuadrotorState(
@@ -47,7 +50,9 @@ class QuadrotorState(CustomPyTree):
             motor_omega=jax.lax.stop_gradient(self.motor_omega),
             acc=jax.lax.stop_gradient(self.acc),
             dr_key=jax.lax.stop_gradient(self.dr_key),
-            fix_key=jax.lax.stop_gradient(self.fix_key)
+            fix_key=jax.lax.stop_gradient(self.fix_key),
+            omega_err_integral=jax.lax.stop_gradient(self.omega_err_integral),
+            last_omega_err=jax.lax.stop_gradient(self.last_omega_err)
         )
 
     def as_vector(self):
@@ -83,16 +88,20 @@ class Quadrotor:
             self,
             *,
             mass=1,  # [kg]
-            tbm_fr=jnp.array([0.04,   0.04, 0.0]),  # [m]
-            tbm_bl=jnp.array([-0.04, -0.04, 0.0]),  # [m]
-            tbm_br=jnp.array([-0.04,  0.04, 0.0]),  # [m]
-            tbm_fl=jnp.array([0.04,  -0.04, 0.0]),  # [m]
-            inertia=jnp.array([0.00014, 0.00016, 0.0002]),  # [kgm^2]
+            tbm_fr=jnp.array([0.15,   0.15, 0.0]),  # [m]
+            tbm_bl=jnp.array([-0.15, -0.15, 0.0]),  # [m]
+            tbm_br=jnp.array([-0.15,  0.15, 0.0]),  # [m]
+            tbm_fl=jnp.array([0.15,  -0.15, 0.0]),  # [m]
+            # tbm_fr=jnp.array([0.04,   0.04, 0.0]),  # [m]
+            # tbm_bl=jnp.array([-0.04, -0.04, 0.0]),  # [m]
+            # tbm_br=jnp.array([-0.04,  0.04, 0.0]),  # [m]
+            # tbm_fl=jnp.array([0.04,  -0.04, 0.0]),  # [m]
+            inertia=jnp.array([0.029125, 0.029125, 0.055225]),  # [kgm^2]
             motor_omega_min=150.0,  # [rad/s]
             motor_omega_max=7000.0,  # [rad/s]
-            motor_tau=0.04,  # [s]
+            motor_tau=0.015,  # [s] 减小以匹配SITL的更快响应
             motor_inertia=2.6e-7,  # [kgm^2]
-            omega_max=jnp.array([0.5, 0.5, 0.5]),  # [rad/s]
+            omega_max=jnp.array([0.8, 0.8, 0.6]),  # [rad/s] 增加以匹配SITL的更高机动性
             thrust_map=jnp.array([2e-7, 0.0,  0.0]),
             kappa=0.008,  # [Nm/N]
             thrust_min=0.0,  # [N]
@@ -266,13 +275,29 @@ class Quadrotor:
                 Runs by default at 1 kHz.
                 """
 
-                motor_omega_d = self._low_level_controller(
+                motor_omega_d, omega_err_integral_new, omega_err_new = self._low_level_controller(
                     state, f_d, omega_d, quad_params
                 )
 
                 state = self._dynamics(
                     state, motor_omega_d, self._dt_low_level, drag_params, quad_params
                 )
+                
+                # 更新PID状态
+                state = QuadrotorState(
+                    p=state.p,
+                    R=state.R,
+                    v=state.v,
+                    omega=state.omega,
+                    domega=state.domega,
+                    motor_omega=state.motor_omega,
+                    acc=state.acc,
+                    dr_key=state.dr_key,
+                    fix_key=state.fix_key,
+                    omega_err_integral=omega_err_integral_new,
+                    last_omega_err=omega_err_new
+                )
+                
                 return state, None
 
             N = np.ceil(dt / self._dt_low_level).item()
@@ -371,7 +396,9 @@ class Quadrotor:
             motor_omega=motor_omega_new,
             acc=acc,
             dr_key=key_next,
-            fix_key=state.fix_key
+            fix_key=state.fix_key,
+            omega_err_integral=state.omega_err_integral,  # 保留PID状态，将在control_fn中更新
+            last_omega_err=state.last_omega_err
         )
 
     def motor_omega_to_thrust(self, motor_omega):
@@ -430,7 +457,8 @@ class Quadrotor:
         # Randomize maximum angular velocity: ±30% variation around 0.5 rad/s
         # For each axis, omega_max in range [0.35, 0.65] rad/s
         omega_base = 0.5  # rad/s
-        omega_max = jax.random.uniform(key_omega, shape=(3,), minval=omega_base * 0.7, maxval=omega_base * 1.3)
+        # omega_max = jax.random.uniform(key_omega, shape=(3,), minval=omega_base * 0.7, maxval=omega_base * 1.3)
+        omega_max = jax.random.uniform(key_omega, shape=(3,), minval=0.49, maxval=0.51)
         
         # Randomize motor_tau: ±30% fluctuation around the base value
         tau_multiplier = jax.random.uniform(key_tau, minval=0.7, maxval=1.3)
@@ -465,15 +493,35 @@ class Quadrotor:
         # 如果没有提供quad_params，使用默认的
         quad_params = quad_params or self.default_params()
         
-        # P control on body rates
-        K = jnp.diag(jnp.array([22.0, 22.0, 12.0]))
-        #k_lead = 0.02
-        #tau_lag = 0.005
+        # PID控制参数（调整以匹配SITL的更快响应）
+        Kp = jnp.diag(jnp.array([60.0, 60.0, 30.0]))  # 比例增益（提高约35%以获得更快响应）
+        Ki = jnp.diag(jnp.array([0, 0, 0]))     # 积分增益（添加小的积分项以消除稳态误差）
+        Kd = jnp.diag(jnp.array([0, 0, 0]))    # 微分增益（添加以减少超调）
+        
         omega = state.omega
         omega_err = omega_cmd - omega
-        body_torques_cmd = self.inertial_matrix() @ K @ omega_err + jnp.cross(
+        
+        # 比例项
+        P_term = Kp @ omega_err
+        
+        # 积分项（累积误差，带积分饱和限制）
+        integral_max = jnp.array([2.0, 2.0, 1.0])  # 积分饱和限制
+        omega_err_integral_new = state.omega_err_integral + omega_err * self._dt_low_level
+        omega_err_integral_new = jnp.clip(omega_err_integral_new, -integral_max, integral_max)
+        I_term = Ki @ omega_err_integral_new
+        
+        # 微分项（误差变化率）
+        omega_err_derivative = (omega_err - state.last_omega_err) / self._dt_low_level
+        D_term = Kd @ omega_err_derivative
+        
+        # PID控制输出
+        pid_output = P_term + I_term + D_term
+        
+        # 计算期望的力矩指令（包含角速度交叉项）
+        body_torques_cmd = self.inertial_matrix() @ pid_output + jnp.cross(
             omega, self.inertial_matrix() @ omega
         )
+        
         alpha = jnp.concatenate([f_T[None], body_torques_cmd])
         f_cmd = self.allocation_matrix_inv @ alpha
         # Use thrust_max from quad_params
@@ -482,7 +530,9 @@ class Quadrotor:
         motor_omega_d = jnp.clip(
             motor_omega_d, self._motor_omega_min, self._motor_omega_max
         )
-        return motor_omega_d
+        
+        # 返回电机指令和更新后的PID状态
+        return motor_omega_d, omega_err_integral_new, omega_err
 
 if __name__ == "__main__":
 

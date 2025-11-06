@@ -24,6 +24,8 @@ from mavsdk.offboard import (AttitudeRate, OffboardError, PositionNedYaw)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from aquila.modules.mlp import MLP
+from aquila.envs.target_trackVer5 import TrackEnvVer5
+from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 
 """
 Test TrackVer5 policy with Gazebo SITL using MAVLink communication.
@@ -177,7 +179,7 @@ async def run():
     np.random.seed(seed)
     
     # ==================== Load Policy ====================
-    policy_file = 'aquila/param_saved/trackVer5_policy.pkl'
+    policy_file = 'aquila/param_saved/trackVer5_policy_iris.pkl'
     
     if not os.path.exists(policy_file):
         print(f"❌ Error: Policy file not found: {policy_file}")
@@ -239,6 +241,74 @@ async def run():
     input_dim = buffer_size * (obs_dim + action_dim)
     policy = MLP([input_dim, 128, 128, action_dim], initial_scale=0.2)
     
+    # ==================== Parallel Environment Simulation Setup ====================
+    # Setup TrackEnvVer5 environment for comparison (same as test_trackVer5.py)
+    env_sim = TrackEnvVer5(
+        max_steps_in_episode=1000,
+        dt=0.01,
+        delay=0.03,
+        omega_std=0.1,
+        action_penalty_weight=0.5,
+        # Observation dynamics time constants
+        obs_tau_pos=0.3,
+        obs_tau_vel=0.2,
+        obs_tau_R=0.02,
+        # Tracking specific parameters
+        target_height=2.0,
+        target_init_distance_min=1,
+        target_init_distance_max=1,
+        target_speed_max=1.0,
+        reset_distance=100.0,
+        max_speed=20.0,
+        # Parameter randomization (quadrotor)
+        thrust_to_weight_min=1.4,
+        thrust_to_weight_max=1.5,
+    )
+    
+    # Apply same wrappers as training
+    env_sim = MinMaxObservationWrapper(env_sim)
+    env_sim = NormalizeActionWrapper(env_sim)
+    
+    # Initialize environment simulation with same random seed
+    # Note: Initial state may differ from SITL due to different reset mechanisms,
+    # but we use the same action sequence to compare dynamics differences
+    env_key = jax.random.key(seed)
+    env_key, subkey = jax.random.split(env_key)
+    env_state, env_obs = env_sim.reset(subkey)
+    
+    print(f"\n{'='*60}")
+    print(f"Environment Simulation Initial State:")
+    print(f"  Quad position: {np.array(env_state.quadrotor_state.p)}")
+    print(f"  Target position: {np.array(env_state.target_pos)}")
+    print(f"  Initial distance: {float(safe_norm(env_state.quadrotor_state.p - env_state.target_pos)):.3f}m")
+    print(f"{'='*60}\n")
+    
+    # Initialize environment simulation buffer (same as SITL buffer)
+    env_action_obs_combined = jnp.concatenate([hovering_action_normalized, env_obs])
+    env_action_obs_buffer = jnp.tile(env_action_obs_combined[None, None, :], (1, buffer_size, 1))
+    
+    # Get initial action from environment simulation
+    env_action_obs_buffer_flat = env_action_obs_buffer.reshape(1, -1)
+    env_initial_action = policy.apply(params, env_action_obs_buffer_flat)[0]
+    env_current_action = env_initial_action
+    env_action_counter = 0
+    
+    # Data storage for environment simulation comparison
+    env_sim_data = {
+        'time': [],
+        'quad_pos': [],
+        'quad_vel': [],
+        'quad_R': [],
+        'quad_omega': [],
+        'target_pos': [],
+        'target_vel': [],
+        'action': [],
+        'reward': [],
+        'distance': [],
+        'height': [],
+        'angle_body_x_target': [],
+    }
+    
     print(f"\n{'='*60}")
     print(f"Configuration:")
     print(f"  Observation dim: {obs_dim}")
@@ -251,6 +321,7 @@ async def run():
     print(f"  Target height: {target_height}m")
     print(f"  Hovering thrust (Gazebo [0,1]): {hovering_thrust_gazebo:.3f}")
     print(f"  Hovering thrust (Network [-1,1]): {hovering_thrust_network:.3f}")
+    print(f"  Parallel env simulation: Enabled")
     print(f"{'='*60}\n")
     
     # ==================== TensorBoard Setup ====================
@@ -471,7 +542,12 @@ async def run():
         omega_network = np.array([current_action[1], current_action[2], current_action[3]])
         omega_cmd = denormalize_action(omega_network, -omega_max, omega_max)
         
-        # Angular rates in rad/s (convert to deg/s for MAVLink)
+        # Angular rates in rad/s (for logging)
+        roll_rate_rad_s = float(omega_cmd[0])
+        pitch_rate_rad_s = float(omega_cmd[1])
+        yaw_rate_rad_s = float(omega_cmd[2])
+        
+        # Angular rates in deg/s (convert to deg/s for MAVLink)
         roll_rate_deg = omega_cmd[0] * 180.0 / np.pi
         pitch_rate_deg = omega_cmd[1] * 180.0 / np.pi
         yaw_rate_deg = omega_cmd[2] * 180.0 / np.pi
@@ -485,6 +561,62 @@ async def run():
                 thrust_value=float(thrust_normalized)
             )
         )
+        
+        # ==================== Parallel Environment Simulation Step ====================
+        # Use the SAME action as SITL for environment simulation (for fair comparison)
+        # This ensures we're comparing the same policy actions applied to different dynamics
+        env_action_to_apply = current_action  # Use the same action as SITL
+        
+        # Convert environment simulation action to rad/s for logging
+        env_omega_network = np.array([env_action_to_apply[1], env_action_to_apply[2], env_action_to_apply[3]])
+        env_omega_cmd = denormalize_action(env_omega_network, -omega_max, omega_max)
+        env_roll_rate_rad_s = float(env_omega_cmd[0])
+        env_pitch_rate_rad_s = float(env_omega_cmd[1])
+        env_yaw_rate_rad_s = float(env_omega_cmd[2])
+        
+        # Step environment simulation with the same action used for SITL
+        env_key, subkey = jax.random.split(env_key)
+        env_transition = env_sim.step(env_state, env_action_to_apply, subkey)
+        env_state, env_obs, env_reward, env_terminated, env_truncated, env_info = env_transition
+        
+        # Update environment simulation buffer (same logic as SITL)
+        # Buffer should be updated with the action that was applied and the new observation
+        if env_action_counter % action_repeat == 0:
+            # Update buffer with new action and observation
+            env_action_obs_buffer = jnp.roll(env_action_obs_buffer, shift=-1, axis=1)
+            env_action_obs_combined_new = jnp.concatenate([env_action_to_apply, env_obs])
+            env_action_obs_buffer = env_action_obs_buffer.at[0, -1, :].set(env_action_obs_combined_new)
+            
+            env_action_counter = 1
+        else:
+            # Update only observation part (action remains the same)
+            env_action_obs_buffer = jnp.roll(env_action_obs_buffer, shift=-1, axis=1)
+            env_action_obs_combined_new = jnp.concatenate([env_action_to_apply, env_obs])
+            env_action_obs_buffer = env_action_obs_buffer.at[0, -1, :].set(env_action_obs_combined_new)
+            env_action_counter += 1
+        
+        # Record environment simulation data
+        env_sim_data['time'].append(float(env_state.time))
+        env_sim_data['quad_pos'].append(np.array(env_state.quadrotor_state.p))
+        env_sim_data['quad_vel'].append(np.array(env_state.quadrotor_state.v))
+        env_sim_data['quad_R'].append(np.array(env_state.quadrotor_state.R))
+        env_sim_data['quad_omega'].append(np.array(env_state.quadrotor_state.omega))
+        env_sim_data['target_pos'].append(np.array(env_state.target_pos))
+        env_sim_data['target_vel'].append(np.array(env_state.target_vel))
+        env_sim_data['action'].append(np.array(env_action_to_apply))
+        env_sim_data['reward'].append(float(env_reward))
+        
+        # Compute metrics for environment simulation
+        env_distance = float(safe_norm(env_state.quadrotor_state.p - env_state.target_pos))
+        env_sim_data['distance'].append(env_distance)
+        env_height = float(-env_state.quadrotor_state.p[2])  # NED: negative z is up
+        env_sim_data['height'].append(env_height)
+        env_angle = float(compute_angle_between_body_x_and_target(
+            env_state.quadrotor_state.R,
+            env_state.quadrotor_state.p,
+            env_state.target_pos
+        ))
+        env_sim_data['angle_body_x_target'].append(env_angle)
             
         # ==================== Update State from Telemetry ====================
         odometry = latest_state["odometry"]
@@ -575,14 +707,14 @@ async def run():
         writer.add_scalar('Attitude/Pitch_deg', attitude.pitch_deg, step)
         writer.add_scalar('Attitude/Yaw_deg', attitude.yaw_deg, step)
         
-        writer.add_scalar('Angular_Velocity/Roll_rad_s', float(quad_omega[0]), step)
-        writer.add_scalar('Angular_Velocity/Pitch_rad_s', float(quad_omega[1]), step)
+        # Roll and pitch angular velocities will be logged together with EnvSim for comparison
+        # Yaw angular velocity remains separate
         writer.add_scalar('Angular_Velocity/Yaw_rad_s', float(quad_omega[2]), step)
         
         writer.add_scalar('Action/Thrust_normalized', thrust_normalized, step)
-        writer.add_scalar('Action/Roll_rate_deg_s', roll_rate_deg, step)
-        writer.add_scalar('Action/Pitch_rate_deg_s', pitch_rate_deg, step)
-        writer.add_scalar('Action/Yaw_rate_deg_s', yaw_rate_deg, step)
+        writer.add_scalar('Action/Roll_rate_rad_s', roll_rate_rad_s, step)
+        writer.add_scalar('Action/Pitch_rate_rad_s', pitch_rate_rad_s, step)
+        writer.add_scalar('Action/Yaw_rate_rad_s', yaw_rate_rad_s, step)
         
         # Log network raw output (in [-1, 1] range)
         if current_network_output is not None:
@@ -618,14 +750,66 @@ async def run():
         writer.add_scalar('Target/East', float(target_pos[1]), step)
         writer.add_scalar('Target/Down', float(target_pos[2]), step)
         
+        # ==================== Log Environment Simulation Comparison ====================
+        # Log environment simulation metrics for comparison
+        writer.add_scalar('EnvSim_Metrics/Distance', env_distance, step)
+        writer.add_scalar('EnvSim_Metrics/Height', env_height, step)
+        writer.add_scalar('EnvSim_Metrics/Angle_to_Target', env_angle, step)
+        writer.add_scalar('EnvSim_Metrics/Reward', float(env_reward), step)
+        
+        writer.add_scalar('EnvSim_Position/North', float(env_state.quadrotor_state.p[0]), step)
+        writer.add_scalar('EnvSim_Position/East', float(env_state.quadrotor_state.p[1]), step)
+        writer.add_scalar('EnvSim_Position/Down', float(env_state.quadrotor_state.p[2]), step)
+        
+        writer.add_scalar('EnvSim_Velocity/North', float(env_state.quadrotor_state.v[0]), step)
+        writer.add_scalar('EnvSim_Velocity/East', float(env_state.quadrotor_state.v[1]), step)
+        writer.add_scalar('EnvSim_Velocity/Down', float(env_state.quadrotor_state.v[2]), step)
+        
+        # Compute Euler angles from rotation matrix for environment simulation
+        env_R = env_state.quadrotor_state.R
+        env_roll = float(jnp.arctan2(env_R[2, 1], env_R[2, 2])) * 180.0 / np.pi
+        env_pitch = float(jnp.arcsin(-env_R[2, 0])) * 180.0 / np.pi
+        env_yaw = float(jnp.arctan2(env_R[1, 0], env_R[0, 0])) * 180.0 / np.pi
+        
+        writer.add_scalar('EnvSim_Attitude/Roll_deg', env_roll, step)
+        writer.add_scalar('EnvSim_Attitude/Pitch_deg', env_pitch, step)
+        writer.add_scalar('EnvSim_Attitude/Yaw_deg', env_yaw, step)
+        
+        # Log roll and pitch angular velocities together with SITL for comparison
+        writer.add_scalars('Angular_Velocity/Roll_rad_s', {
+            'SITL': float(quad_omega[0]),
+            'EnvSim': float(env_state.quadrotor_state.omega[0])
+        }, step)
+        writer.add_scalars('Angular_Velocity/Pitch_rad_s', {
+            'SITL': float(quad_omega[1]),
+            'EnvSim': float(env_state.quadrotor_state.omega[1])
+        }, step)
+        writer.add_scalar('EnvSim_Angular_Velocity/Yaw_rad_s', float(env_state.quadrotor_state.omega[2]), step)
+        
+        # Log environment simulation actions (in rad/s)
+        # Convert thrust from normalized [-1, 1] to [0, 1] for comparison
+        env_thrust_normalized = normalize_action_for_gazebo(jnp.array([env_action_to_apply[0]]))[0]
+        writer.add_scalar('EnvSim_Action/Thrust_normalized', float(env_thrust_normalized), step)
+        writer.add_scalar('EnvSim_Action/Roll_rate_rad_s', env_roll_rate_rad_s, step)
+        writer.add_scalar('EnvSim_Action/Pitch_rate_rad_s', env_pitch_rate_rad_s, step)
+        writer.add_scalar('EnvSim_Action/Yaw_rate_rad_s', env_yaw_rate_rad_s, step)
+        
+        # Log comparison differences
+        writer.add_scalar('Comparison/Distance_Diff', distance - env_distance, step)
+        writer.add_scalar('Comparison/Height_Diff', height - env_height, step)
+        writer.add_scalar('Comparison/Angle_Diff', angle_to_target - env_angle, step)
+        writer.add_scalar('Comparison/Roll_rate_Diff_rad_s', roll_rate_rad_s - env_roll_rate_rad_s, step)
+        writer.add_scalar('Comparison/Pitch_rate_Diff_rad_s', pitch_rate_rad_s - env_pitch_rate_rad_s, step)
+        writer.add_scalar('Comparison/Yaw_rate_Diff_rad_s', yaw_rate_rad_s - env_yaw_rate_rad_s, step)
+        
         # ==================== Print Progress ====================
         if step % 50 == 0:
             print(f"Step {step:4d} | "
-                  f"Dist: {distance:6.3f}m | "
-                  f"Height: {height:5.2f}m | "
+                  f"Dist: {distance:6.3f}m (EnvSim: {env_distance:6.3f}m) | "
+                  f"Height: {height:5.2f}m (EnvSim: {env_height:5.2f}m) | "
                   f"Speed: {speed:5.2f}m/s | "
-                  f"Angle: {angle_to_target:5.1f}° | "
-                  f"Reward: {reward:7.3f}")
+                  f"Angle: {angle_to_target:5.1f}° (EnvSim: {env_angle:5.1f}°) | "
+                  f"Reward: {reward:7.3f} (EnvSim: {float(env_reward):7.3f})")
         
         # ==================== Timing ====================
         step_end_time = time.perf_counter()
@@ -647,14 +831,24 @@ async def run():
     print(f"\n{'='*60}")
     print(f"Test episode completed!")
     print(f"Total steps: {step + 1}")
-    print(f"Final distance: {distance:.3f}m")
-    print(f"Final height: {height:.3f}m")
+    print(f"Final distance (SITL): {distance:.3f}m")
+    print(f"Final height (SITL): {height:.3f}m")
+    print(f"Final distance (EnvSim): {env_distance:.3f}m")
+    print(f"Final height (EnvSim): {env_height:.3f}m")
     print(f"{'='*60}\n")
     
     telemetry_task.cancel()
     attitude_task.cancel()
     
     writer.close()
+    
+    # Save environment simulation data for comparison
+    output_dir = 'aquila/output'
+    os.makedirs(output_dir, exist_ok=True)
+    env_sim_data_file = os.path.join(output_dir, 'test_data_comparing.pkl')
+    with open(env_sim_data_file, 'wb') as f:
+        pickle.dump(env_sim_data, f)
+    print(f"✅ Environment simulation data saved to: {env_sim_data_file}")
     
     print(f"✅ TensorBoard logs saved to: {log_path}")
     print(f"   View with: tensorboard --logdir={log_path}\n")

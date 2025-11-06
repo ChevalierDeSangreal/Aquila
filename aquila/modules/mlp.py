@@ -51,7 +51,7 @@ class MLP(nn.Module):
             ),
             bias_init=nn.initializers.zeros,
         )(x)
-        return x + self.action_bias
+        return jnp.tanh(x + self.action_bias)
 
     def initialize(self, key):
         """

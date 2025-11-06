@@ -251,7 +251,7 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
         R = R_z @ R_y @ R_x
         
         # 随机角速度
-        omega = jax.random.normal(key_omega, (3,)) * self.omega_std
+        omega = jax.random.normal(key_omega, (3,)) * self.omega_std * 0
 
         # Initialize quadrotor state
         # Quadrotor.create_state 使用位置参数 p, R, v，其他参数通过 kwargs 传递

@@ -11,7 +11,8 @@ __pycache__/
 
 # temporary output
 *runs/*
-runs/*
+runs/* */
+/aquila/test_runs/*
 *output/*
 
 # C extensions
