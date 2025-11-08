@@ -6,6 +6,7 @@ import random
 import time
 import asyncio
 import pickle
+from collections import defaultdict
 
 import numpy as np
 import jax
@@ -24,8 +25,8 @@ from mavsdk.offboard import (AttitudeRate, OffboardError, PositionNedYaw)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from aquila.modules.mlp import MLP
-from aquila.envs.target_trackVer5 import TrackEnvVer5
-from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
+# from aquila.envs.target_trackVer5 import TrackEnvVer5  # Disabled for performance
+# from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper  # Disabled for performance
 
 """
 Test TrackVer5 policy with Gazebo SITL using MAVLink communication.
@@ -179,7 +180,8 @@ async def run():
     np.random.seed(seed)
     
     # ==================== Load Policy ====================
-    policy_file = 'aquila/param_saved/trackVer5_policy_iris.pkl'
+    # policy_file = 'aquila/param_saved/trackVer7_policy_with_Kp_rand.pkl'
+    policy_file = 'aquila/param_saved/trackVer6_policy.pkl'
     
     if not os.path.exists(policy_file):
         print(f"❌ Error: Policy file not found: {policy_file}")
@@ -191,7 +193,7 @@ async def run():
     # ==================== Environment Configuration ====================
     # Test configuration (independent of training env_config)
     dt = 0.01  # Time step in seconds
-    max_steps = 1000  # Maximum number of steps per episode
+    max_steps = 1000  # Maximum number of steps per episode (doubled for extended testing)
     target_height = 2.0  # Target height in meters
     
     # Infer observation dimension from input_dim and buffer_size
@@ -240,88 +242,29 @@ async def run():
     # ==================== Model Setup ====================
     input_dim = buffer_size * (obs_dim + action_dim)
     policy = MLP([input_dim, 128, 128, action_dim], initial_scale=0.2)
+    policy_apply = jax.jit(lambda p, x: policy.apply(p, x))
     
-    # ==================== Parallel Environment Simulation Setup ====================
-    # Setup TrackEnvVer5 environment for comparison (same as test_trackVer5.py)
-    env_sim = TrackEnvVer5(
-        max_steps_in_episode=1000,
-        dt=0.01,
-        delay=0.03,
-        omega_std=0.1,
-        action_penalty_weight=0.5,
-        # Observation dynamics time constants
-        obs_tau_pos=0.3,
-        obs_tau_vel=0.2,
-        obs_tau_R=0.02,
-        # Tracking specific parameters
-        target_height=2.0,
-        target_init_distance_min=1,
-        target_init_distance_max=1,
-        target_speed_max=1.0,
-        reset_distance=100.0,
-        max_speed=20.0,
-        # Parameter randomization (quadrotor)
-        thrust_to_weight_min=1.4,
-        thrust_to_weight_max=1.5,
-    )
-    
-    # Apply same wrappers as training
-    env_sim = MinMaxObservationWrapper(env_sim)
-    env_sim = NormalizeActionWrapper(env_sim)
-    
-    # Initialize environment simulation with same random seed
-    # Note: Initial state may differ from SITL due to different reset mechanisms,
-    # but we use the same action sequence to compare dynamics differences
-    env_key = jax.random.key(seed)
-    env_key, subkey = jax.random.split(env_key)
-    env_state, env_obs = env_sim.reset(subkey)
-    
-    print(f"\n{'='*60}")
-    print(f"Environment Simulation Initial State:")
-    print(f"  Quad position: {np.array(env_state.quadrotor_state.p)}")
-    print(f"  Target position: {np.array(env_state.target_pos)}")
-    print(f"  Initial distance: {float(safe_norm(env_state.quadrotor_state.p - env_state.target_pos)):.3f}m")
-    print(f"{'='*60}\n")
-    
-    # Initialize environment simulation buffer (same as SITL buffer)
-    env_action_obs_combined = jnp.concatenate([hovering_action_normalized, env_obs])
-    env_action_obs_buffer = jnp.tile(env_action_obs_combined[None, None, :], (1, buffer_size, 1))
-    
-    # Get initial action from environment simulation
-    env_action_obs_buffer_flat = env_action_obs_buffer.reshape(1, -1)
-    env_initial_action = policy.apply(params, env_action_obs_buffer_flat)[0]
-    env_current_action = env_initial_action
-    env_action_counter = 0
-    
-    # Data storage for environment simulation comparison
-    env_sim_data = {
-        'time': [],
-        'quad_pos': [],
-        'quad_vel': [],
-        'quad_R': [],
-        'quad_omega': [],
-        'target_pos': [],
-        'target_vel': [],
-        'action': [],
-        'reward': [],
-        'distance': [],
-        'height': [],
-        'angle_body_x_target': [],
-    }
+    # ==================== Environment Simulation Disabled for Performance ====================
+    # Environment simulation has been disabled to achieve 100Hz control rate
+    # It was taking ~280ms per step, causing control delays
     
     print(f"\n{'='*60}")
     print(f"Configuration:")
     print(f"  Observation dim: {obs_dim}")
     print(f"  Action dim: {action_dim}")
     print(f"  Buffer size: {buffer_size}")
-    print(f"  Action repeat: {action_repeat}")
+    print(f"  Action repeat: {action_repeat} (每个action持续{action_repeat * dt:.3f}s)")
     print(f"  Input dim: {input_dim}")
-    print(f"  Time step: {dt}s")
+    print(f"  Time step: {dt}s (100Hz)")
     print(f"  Max steps: {max_steps}")
     print(f"  Target height: {target_height}m")
     print(f"  Hovering thrust (Gazebo [0,1]): {hovering_thrust_gazebo:.3f}")
     print(f"  Hovering thrust (Network [-1,1]): {hovering_thrust_network:.3f}")
-    print(f"  Parallel env simulation: Enabled")
+    print(f"  Parallel env simulation: Disabled (for performance)")
+    print(f"\n  📊 ulog对齐:")
+    print(f"     - TensorBoard step 0 对应 ulog命令索引 25")
+    print(f"     - 前25条是预热命令（20条offboard + 5条JAX编译）")
+    print(f"     - 查看TensorBoard的 'Debug/Global_Command_Index' 曲线")
     print(f"{'='*60}\n")
     
     # ==================== TensorBoard Setup ====================
@@ -333,6 +276,9 @@ async def run():
     os.makedirs(log_path, exist_ok=True)
     
     writer = SummaryWriter(log_path)
+    tb_scalars = defaultdict(list)
+    timing_records = defaultdict(list)
+    step_log_queue = []
     writer.add_text(
         "hyperparameters",
         f"|param|value|\n|-|-|\n"
@@ -343,6 +289,22 @@ async def run():
         f"|dt|{dt}|\n"
         f"|max_steps|{max_steps}|\n"
         f"|target_height|{target_height}|\n"
+    )
+    
+    writer.add_text(
+        "ulog_alignment",
+        "**📊 如何对齐TensorBoard和ulog：**\n\n"
+        "- TensorBoard step 0 = ulog中第25条attitude_rate命令\n"
+        "- 前25条命令是预热命令：\n"
+        "  - 前20条：offboard模式预热（set_attitude_rate，每次0.02s）\n"
+        "  - 后5条：JAX编译预热（悬停命令，每次0.01s）\n"
+        "- 使用 `Debug/Global_Command_Index` 曲线查看全局命令索引\n"
+        "- 每个action持续 action_repeat=10 个steps（0.1秒）\n"
+        "- TensorBoard记录频率：100Hz (dt=0.01s)\n"
+        "- ulog记录频率：通常250Hz\n\n"
+        "**对齐公式：**\n"
+        "- `ulog_command_number = Global_Command_Index`\n"
+        "- `tensorboard_step = ulog_command_number - 25`\n"
     )
     
     print(f"TensorBoard logs: {log_path}\n")
@@ -439,7 +401,7 @@ async def run():
         -target_height      # at target height (negative z is up)
     ])
     
-    target_vel = jnp.zeros(3)  # Target is stationary
+    target_vel = jnp.array([1, 0.0, 0.0])
     
     initial_distance = float(jnp.linalg.norm(target_pos - quad_pos))
     print(f"Initial quadrotor position: {np.array(quad_pos)}")
@@ -484,24 +446,192 @@ async def run():
     # Get initial action
     # Reshape to (1, -1) to match training: (num_envs, buffer_size * (obs_dim + action_dim))
     action_obs_buffer_flat = action_obs_buffer.reshape(1, -1)
-    initial_action = policy.apply(params, action_obs_buffer_flat)[0]
+    initial_action = policy_apply(params, action_obs_buffer_flat)[0]
+    jax.block_until_ready(initial_action)
+    
+    print(f"\n{'='*60}")
+    print(f"🎯 INITIAL ACTION (will be used for first few steps):")
+    print(f"   thrust={float(initial_action[0]):+.3f}, roll={float(initial_action[1]):+.3f}, "
+          f"pitch={float(initial_action[2]):+.3f}, yaw={float(initial_action[3]):+.3f}")
+    print(f"{'='*60}\n")
+    
+    # 立即更新buffer（确保下次推理时输入不同）
+    action_obs_buffer = jnp.roll(action_obs_buffer, shift=-1, axis=1)
+    action_obs_combined_new = jnp.concatenate([initial_action, obs_normalized])
+    action_obs_buffer = action_obs_buffer.at[0, -1, :].set(action_obs_combined_new)
     
     current_action = initial_action
-    action_counter = 0
+    # 初始化为1，表示initial_action已获取，将持续到action_repeat后才获取新action
+    action_counter = 1
     
     # Variables to store network input and output for TensorBoard logging
     current_network_input = np.array(action_obs_buffer_flat[0])  # Store initial network input
     current_network_output = np.array(initial_action)  # Store initial network output
     
+    warm_angle = compute_angle_between_body_x_and_target(quad_R, quad_pos, target_pos)
+    jax.block_until_ready(warm_angle)
+
+    # ==================== JAX Compilation Warmup ====================
+    # 执行warmup推理来预编译JAX函数，同时预热MAVLink命令发送和状态计算
+    print(f"{'='*60}")
+    print(f"Warming up JAX compilation and MAVLink...")
+    print(f"{'='*60}\n")
+    
+    warmup_steps = 10
+    warmup_action_counter = action_counter
+    warmup_buffer = action_obs_buffer  # JAX数组是immutable的，可以直接赋值
+    
+    print(f"Starting warmup with action_counter={action_counter}")
+    
+    for warmup_iter in range(warmup_steps):
+        warmup_start = time.perf_counter()
+        
+        # 模拟主循环的网络推理逻辑（用于JAX编译）
+        if warmup_action_counter % action_repeat == 0:
+            print(f"  Warmup iter {warmup_iter}: counter={warmup_action_counter}, getting NEW warmup action")
+            warmup_buffer_for_input = jnp.roll(warmup_buffer, shift=-1, axis=1)
+            empty_action = jnp.zeros(action_dim)
+            action_obs_combined_empty = jnp.concatenate([empty_action, obs_normalized])
+            warmup_buffer_for_input = warmup_buffer_for_input.at[0, -1, :].set(action_obs_combined_empty)
+            
+            warmup_buffer_flat = warmup_buffer_for_input.reshape(1, -1)
+            warmup_action = policy_apply(params, warmup_buffer_flat)[0]
+            jax.block_until_ready(warmup_action)
+            print(f"       Warmup action: thrust={float(warmup_action[0]):+.3f}, roll={float(warmup_action[1]):+.3f}")
+            
+            warmup_buffer = jnp.roll(warmup_buffer, shift=-1, axis=1)
+            action_obs_combined_new = jnp.concatenate([warmup_action, obs_normalized])
+            warmup_buffer = warmup_buffer.at[0, -1, :].set(action_obs_combined_new)
+            
+            warmup_action_counter = 1
+        else:
+            warmup_action_counter += 1
+        
+        # 预热MAVLink命令发送（使用实际的action转换逻辑）
+        warmup_thrust_network = float(hovering_action_normalized[0])
+        warmup_thrust_gazebo = normalize_action_for_gazebo(jnp.array([warmup_thrust_network]))[0]
+        warmup_thrust_normalized = float(np.clip(warmup_thrust_gazebo, 0.0, 1.0))
+        
+        warmup_omega = np.array([0.0, 0.0, 0.0])
+        warmup_roll_rate_deg = warmup_omega[0] * 180.0 / np.pi
+        warmup_pitch_rate_deg = warmup_omega[1] * 180.0 / np.pi
+        warmup_yaw_rate_deg = warmup_omega[2] * 180.0 / np.pi
+        
+        await drone.offboard.set_attitude_rate(
+            AttitudeRate(
+                roll_deg_s=float(warmup_roll_rate_deg),
+                pitch_deg_s=float(warmup_pitch_rate_deg),
+                yaw_deg_s=float(warmup_yaw_rate_deg),
+                thrust_value=float(warmup_thrust_normalized)
+            )
+        )
+        
+        # 预热状态更新和几何计算（模拟主循环的完整state update流程）
+        warmup_odometry = latest_state["odometry"]
+        warmup_attitude = latest_state["attitude"]
+        
+        warmup_quad_pos = jnp.array([
+            warmup_odometry.position_body.x_m,
+            warmup_odometry.position_body.y_m,
+            warmup_odometry.position_body.z_m
+        ])
+        
+        warmup_quad_vel = jnp.array([
+            warmup_odometry.velocity_body.x_m_s,
+            warmup_odometry.velocity_body.y_m_s,
+            warmup_odometry.velocity_body.z_m_s
+        ])
+        
+        warmup_quad_euler = jnp.array([
+            warmup_attitude.roll_deg * np.pi / 180.0,
+            warmup_attitude.pitch_deg * np.pi / 180.0,
+            warmup_attitude.yaw_deg * np.pi / 180.0
+        ])
+        
+        warmup_quad_R = euler_to_rotation_matrix(warmup_quad_euler)
+        warmup_R_transpose = jnp.transpose(warmup_quad_R)
+        
+        # 预热几何计算
+        warmup_g_world = jnp.array([0.0, 0.0, 1.0])
+        warmup_g_body = warmup_R_transpose @ warmup_g_world
+        
+        warmup_rel_pos = target_pos - warmup_quad_pos
+        warmup_target_pos_body = warmup_R_transpose @ warmup_rel_pos
+        
+        # 预热observation计算
+        warmup_obs = jnp.concatenate([
+            warmup_quad_vel,
+            warmup_g_body,
+            warmup_target_pos_body,
+        ])
+        warmup_obs_normalized = normalize_observation(warmup_obs, obs_min, obs_max)
+        
+        # 预热metrics计算（包括float转换）
+        warmup_distance = float(safe_norm(warmup_rel_pos))
+        warmup_height = float(-warmup_quad_pos[2])
+        warmup_speed = float(safe_norm(warmup_quad_vel))
+        warmup_angle = float(compute_angle_between_body_x_and_target(
+            warmup_quad_R, warmup_quad_pos, target_pos
+        ))
+        
+        # 确保所有JAX计算完成
+        jax.block_until_ready(warmup_obs_normalized)
+        
+        warmup_elapsed = time.perf_counter() - warmup_start
+        if warmup_iter < 3:
+            print(f"  Warmup iter {warmup_iter}: counter={warmup_action_counter}, elapsed={warmup_elapsed*1000:.2f}ms")
+        
+        await asyncio.sleep(dt)
+    
+    # ✅ 同步warmup后的状态到主循环（关键！）
+    action_counter = warmup_action_counter
+    action_obs_buffer = warmup_buffer
+    
+    print(f"✅ JAX warmup completed ({warmup_steps} iterations)")
+    print(f"   Warmup commands sent: {warmup_steps} hovering commands (not control commands)")
+    print(f"   Action counter after warmup: {action_counter} (initial_action will be used for {action_repeat - action_counter + 1} more steps)\n")
+    
+    # 记录预热命令数量，用于对齐ulog
+    # 20次 attitude_rate 预热命令 + warmup_steps 个悬停命令
+    preheating_commands_sent = 20 + warmup_steps
+    
+    total_iterations = max_steps
+    logged_steps = 0
+
     print(f"{'='*60}")
     print(f"Starting test episode...")
+    print(f"Preheating commands sent before main loop: {preheating_commands_sent}")
+    print(f"  - 20 attitude_rate preheating commands")
+    print(f"  - {warmup_steps} JAX warmup hovering commands")
+    print(f"Main loop will record ALL steps from step 0 (aligned with ulog)")
     print(f"{'='*60}\n")
     
     # ==================== Main Test Loop ====================
-    for step in range(max_steps):
+    for iteration in range(total_iterations):
+        # 所有iteration都记录到TensorBoard
+        log_enabled = True
+        step_idx = iteration
+        # 全局命令计数器（用于对齐ulog）
+        # global_command_idx = 预热命令数 + 当前iteration
+        global_command_idx = preheating_commands_sent + iteration
+
         step_start_time = time.perf_counter()
         
         # ==================== Get New Action (if needed) ====================
+        # 打印前30个steps的counter状态（详细调试）
+        if step_idx < 15:
+            will_get_new = (action_counter % action_repeat == 0)
+            # 显示当前使用的action (简化)
+            current_action_roll_cmd = float(current_action[1])
+            # 获取当前的姿态角
+            current_attitude = latest_state["attitude"]
+            current_roll_deg = float(current_attitude.roll_deg) if current_attitude else 0.0
+            print(f"  [Step {step_idx:2d}, ulog#{global_command_idx:3d}] counter={action_counter:2d}, will_get_new={will_get_new}, "
+                  f"roll_cmd={current_action_roll_cmd:+.3f}, roll_attitude={current_roll_deg:+.2f}°")
+        
+        section_start = time.perf_counter()
+        timing_records['00_debug_print_ms'].append((iteration, (section_start - step_start_time) * 1000.0))
+        
         if action_counter % action_repeat == 0:
             # Create temporary buffer for getting new action
             # Buffer shape is (1, buffer_size, obs_dim + action_dim), roll on axis=1
@@ -513,10 +643,22 @@ async def run():
             # Set the last element in the buffer (along axis=1)
             action_obs_buffer_for_input = action_obs_buffer_for_input.at[0, -1, :].set(action_obs_combined_empty)
             
+            # 打印用于推理的observation（前15步，调试）
+            if step_idx < 15:
+                print(f"       Using obs_normalized[0:3] (v_body): [{float(obs_normalized[0]):+.3f}, {float(obs_normalized[1]):+.3f}, {float(obs_normalized[2]):+.3f}]")
+                print(f"       Using obs_normalized[6:9] (target_pos_body): [{float(obs_normalized[6]):+.3f}, {float(obs_normalized[7]):+.3f}, {float(obs_normalized[8]):+.3f}]")
+            
             # Get new action from network
             # Reshape to (1, -1) to match training format
             action_obs_buffer_flat = action_obs_buffer_for_input.reshape(1, -1)
-            current_action = policy.apply(params, action_obs_buffer_flat)[0]
+            new_action = policy_apply(params, action_obs_buffer_flat)[0]
+            
+            # 打印action变化（前15个steps，帮助调试）
+            if step_idx < 15:
+                print(f"       >>> NEW ACTION: thrust={float(new_action[0]):+.3f}, roll={float(new_action[1]):+.3f}, "
+                      f"pitch={float(new_action[2]):+.3f}, yaw={float(new_action[3]):+.3f}")
+            
+            current_action = new_action
             
             # Store network input and output for TensorBoard logging
             current_network_input = np.array(action_obs_buffer_flat[0])  # Convert to numpy for logging
@@ -530,6 +672,9 @@ async def run():
             action_counter = 1
         else:
             action_counter += 1
+
+        section_after_policy = time.perf_counter()
+        timing_records['01_policy_selection_ms'].append((iteration, (section_after_policy - section_start) * 1000.0))
             
         # ==================== Convert Action to MAVLink Command ====================
         # Network outputs actions in [-1, 1] range
@@ -561,63 +706,10 @@ async def run():
                 thrust_value=float(thrust_normalized)
             )
         )
+
+        section_after_mavlink = time.perf_counter()
+        timing_records['02_mavlink_send_ms'].append((iteration, (section_after_mavlink - section_after_policy) * 1000.0))
         
-        # ==================== Parallel Environment Simulation Step ====================
-        # Use the SAME action as SITL for environment simulation (for fair comparison)
-        # This ensures we're comparing the same policy actions applied to different dynamics
-        env_action_to_apply = current_action  # Use the same action as SITL
-        
-        # Convert environment simulation action to rad/s for logging
-        env_omega_network = np.array([env_action_to_apply[1], env_action_to_apply[2], env_action_to_apply[3]])
-        env_omega_cmd = denormalize_action(env_omega_network, -omega_max, omega_max)
-        env_roll_rate_rad_s = float(env_omega_cmd[0])
-        env_pitch_rate_rad_s = float(env_omega_cmd[1])
-        env_yaw_rate_rad_s = float(env_omega_cmd[2])
-        
-        # Step environment simulation with the same action used for SITL
-        env_key, subkey = jax.random.split(env_key)
-        env_transition = env_sim.step(env_state, env_action_to_apply, subkey)
-        env_state, env_obs, env_reward, env_terminated, env_truncated, env_info = env_transition
-        
-        # Update environment simulation buffer (same logic as SITL)
-        # Buffer should be updated with the action that was applied and the new observation
-        if env_action_counter % action_repeat == 0:
-            # Update buffer with new action and observation
-            env_action_obs_buffer = jnp.roll(env_action_obs_buffer, shift=-1, axis=1)
-            env_action_obs_combined_new = jnp.concatenate([env_action_to_apply, env_obs])
-            env_action_obs_buffer = env_action_obs_buffer.at[0, -1, :].set(env_action_obs_combined_new)
-            
-            env_action_counter = 1
-        else:
-            # Update only observation part (action remains the same)
-            env_action_obs_buffer = jnp.roll(env_action_obs_buffer, shift=-1, axis=1)
-            env_action_obs_combined_new = jnp.concatenate([env_action_to_apply, env_obs])
-            env_action_obs_buffer = env_action_obs_buffer.at[0, -1, :].set(env_action_obs_combined_new)
-            env_action_counter += 1
-        
-        # Record environment simulation data
-        env_sim_data['time'].append(float(env_state.time))
-        env_sim_data['quad_pos'].append(np.array(env_state.quadrotor_state.p))
-        env_sim_data['quad_vel'].append(np.array(env_state.quadrotor_state.v))
-        env_sim_data['quad_R'].append(np.array(env_state.quadrotor_state.R))
-        env_sim_data['quad_omega'].append(np.array(env_state.quadrotor_state.omega))
-        env_sim_data['target_pos'].append(np.array(env_state.target_pos))
-        env_sim_data['target_vel'].append(np.array(env_state.target_vel))
-        env_sim_data['action'].append(np.array(env_action_to_apply))
-        env_sim_data['reward'].append(float(env_reward))
-        
-        # Compute metrics for environment simulation
-        env_distance = float(safe_norm(env_state.quadrotor_state.p - env_state.target_pos))
-        env_sim_data['distance'].append(env_distance)
-        env_height = float(-env_state.quadrotor_state.p[2])  # NED: negative z is up
-        env_sim_data['height'].append(env_height)
-        env_angle = float(compute_angle_between_body_x_and_target(
-            env_state.quadrotor_state.R,
-            env_state.quadrotor_state.p,
-            env_state.target_pos
-        ))
-        env_sim_data['angle_body_x_target'].append(env_angle)
-            
         # ==================== Update State from Telemetry ====================
         odometry = latest_state["odometry"]
         attitude = latest_state["attitude"]
@@ -648,8 +740,8 @@ async def run():
         
         quad_R = euler_to_rotation_matrix(quad_euler)
         
-        # Update target position (stationary for now)
-        # You can add target motion here if needed
+        # Update target position based on its velocity
+        target_pos = target_pos + target_vel * dt
         
         # ==================== Compute Observation ====================
         # Create observation following TrackEnvVer5 format
@@ -687,137 +779,74 @@ async def run():
         height_error = abs(height - target_height)
         height_penalty = -height_error
         reward = distance_penalty + height_penalty
-        
-        # ==================== Log to TensorBoard ====================
-        writer.add_scalar('Metrics/Distance', distance, step)
-        writer.add_scalar('Metrics/Height', height, step)
-        writer.add_scalar('Metrics/Speed', speed, step)
-        writer.add_scalar('Metrics/Angle_to_Target', angle_to_target, step)
-        writer.add_scalar('Metrics/Reward', reward, step)
-        
-        writer.add_scalar('Position/North', float(quad_pos[0]), step)
-        writer.add_scalar('Position/East', float(quad_pos[1]), step)
-        writer.add_scalar('Position/Down', float(quad_pos[2]), step)
-        
-        writer.add_scalar('Velocity/North', float(quad_vel[0]), step)
-        writer.add_scalar('Velocity/East', float(quad_vel[1]), step)
-        writer.add_scalar('Velocity/Down', float(quad_vel[2]), step)
-        
-        writer.add_scalar('Attitude/Roll_deg', attitude.roll_deg, step)
-        writer.add_scalar('Attitude/Pitch_deg', attitude.pitch_deg, step)
-        writer.add_scalar('Attitude/Yaw_deg', attitude.yaw_deg, step)
-        
-        # Roll and pitch angular velocities will be logged together with EnvSim for comparison
-        # Yaw angular velocity remains separate
-        writer.add_scalar('Angular_Velocity/Yaw_rad_s', float(quad_omega[2]), step)
-        
-        writer.add_scalar('Action/Thrust_normalized', thrust_normalized, step)
-        writer.add_scalar('Action/Roll_rate_rad_s', roll_rate_rad_s, step)
-        writer.add_scalar('Action/Pitch_rate_rad_s', pitch_rate_rad_s, step)
-        writer.add_scalar('Action/Yaw_rate_rad_s', yaw_rate_rad_s, step)
-        
-        # Log network raw output (in [-1, 1] range)
-        if current_network_output is not None:
-            writer.add_scalar('Network_Output/Thrust_raw', float(current_network_output[0]), step)
-            writer.add_scalar('Network_Output/Roll_rate_raw', float(current_network_output[1]), step)
-            writer.add_scalar('Network_Output/Pitch_rate_raw', float(current_network_output[2]), step)
-            writer.add_scalar('Network_Output/Yaw_rate_raw', float(current_network_output[3]), step)
-        
-        # Log network input (only current frame observation)
-        # Record only the current frame's observation (the latest observation in the buffer)
-        # The current frame observation is obs_normalized, which is computed from current state
-        if obs_normalized is not None:
-            # Log current frame observation components
-            # For TrackEnvVer5: obs_normalized contains [v_body(3), g_body(3), target_pos_body(3)] = 9 dims
-            # But we'll log all available dimensions dynamically
-            if obs_dim >= 3:
-                writer.add_scalar('Network_Input/Current_Obs_Vx', float(obs_normalized[0]), step)
-                writer.add_scalar('Network_Input/Current_Obs_Vy', float(obs_normalized[1]), step)
-                writer.add_scalar('Network_Input/Current_Obs_Vz', float(obs_normalized[2]), step)
-            if obs_dim >= 6:
-                writer.add_scalar('Network_Input/Current_Obs_Gx', float(obs_normalized[3]), step)
-                writer.add_scalar('Network_Input/Current_Obs_Gy', float(obs_normalized[4]), step)
-                writer.add_scalar('Network_Input/Current_Obs_Gz', float(obs_normalized[5]), step)
-            if obs_dim >= 9:
-                writer.add_scalar('Network_Input/Current_Obs_TargetX', float(obs_normalized[6]), step)
-                writer.add_scalar('Network_Input/Current_Obs_TargetY', float(obs_normalized[7]), step)
-                writer.add_scalar('Network_Input/Current_Obs_TargetZ', float(obs_normalized[8]), step)
-            # Log any additional observation dimensions if obs_dim > 9
-            for i in range(9, obs_dim):
-                writer.add_scalar(f'Network_Input/Current_Obs_Dim{i}', float(obs_normalized[i]), step)
-        
-        writer.add_scalar('Target/North', float(target_pos[0]), step)
-        writer.add_scalar('Target/East', float(target_pos[1]), step)
-        writer.add_scalar('Target/Down', float(target_pos[2]), step)
-        
-        # ==================== Log Environment Simulation Comparison ====================
-        # Log environment simulation metrics for comparison
-        writer.add_scalar('EnvSim_Metrics/Distance', env_distance, step)
-        writer.add_scalar('EnvSim_Metrics/Height', env_height, step)
-        writer.add_scalar('EnvSim_Metrics/Angle_to_Target', env_angle, step)
-        writer.add_scalar('EnvSim_Metrics/Reward', float(env_reward), step)
-        
-        writer.add_scalar('EnvSim_Position/North', float(env_state.quadrotor_state.p[0]), step)
-        writer.add_scalar('EnvSim_Position/East', float(env_state.quadrotor_state.p[1]), step)
-        writer.add_scalar('EnvSim_Position/Down', float(env_state.quadrotor_state.p[2]), step)
-        
-        writer.add_scalar('EnvSim_Velocity/North', float(env_state.quadrotor_state.v[0]), step)
-        writer.add_scalar('EnvSim_Velocity/East', float(env_state.quadrotor_state.v[1]), step)
-        writer.add_scalar('EnvSim_Velocity/Down', float(env_state.quadrotor_state.v[2]), step)
-        
-        # Compute Euler angles from rotation matrix for environment simulation
-        env_R = env_state.quadrotor_state.R
-        env_roll = float(jnp.arctan2(env_R[2, 1], env_R[2, 2])) * 180.0 / np.pi
-        env_pitch = float(jnp.arcsin(-env_R[2, 0])) * 180.0 / np.pi
-        env_yaw = float(jnp.arctan2(env_R[1, 0], env_R[0, 0])) * 180.0 / np.pi
-        
-        writer.add_scalar('EnvSim_Attitude/Roll_deg', env_roll, step)
-        writer.add_scalar('EnvSim_Attitude/Pitch_deg', env_pitch, step)
-        writer.add_scalar('EnvSim_Attitude/Yaw_deg', env_yaw, step)
-        
-        # Log roll and pitch angular velocities together with SITL for comparison
-        writer.add_scalars('Angular_Velocity/Roll_rad_s', {
-            'SITL': float(quad_omega[0]),
-            'EnvSim': float(env_state.quadrotor_state.omega[0])
-        }, step)
-        writer.add_scalars('Angular_Velocity/Pitch_rad_s', {
-            'SITL': float(quad_omega[1]),
-            'EnvSim': float(env_state.quadrotor_state.omega[1])
-        }, step)
-        writer.add_scalar('EnvSim_Angular_Velocity/Yaw_rad_s', float(env_state.quadrotor_state.omega[2]), step)
-        
-        # Log environment simulation actions (in rad/s)
-        # Convert thrust from normalized [-1, 1] to [0, 1] for comparison
-        env_thrust_normalized = normalize_action_for_gazebo(jnp.array([env_action_to_apply[0]]))[0]
-        writer.add_scalar('EnvSim_Action/Thrust_normalized', float(env_thrust_normalized), step)
-        writer.add_scalar('EnvSim_Action/Roll_rate_rad_s', env_roll_rate_rad_s, step)
-        writer.add_scalar('EnvSim_Action/Pitch_rate_rad_s', env_pitch_rate_rad_s, step)
-        writer.add_scalar('EnvSim_Action/Yaw_rate_rad_s', env_yaw_rate_rad_s, step)
-        
-        # Log comparison differences
-        writer.add_scalar('Comparison/Distance_Diff', distance - env_distance, step)
-        writer.add_scalar('Comparison/Height_Diff', height - env_height, step)
-        writer.add_scalar('Comparison/Angle_Diff', angle_to_target - env_angle, step)
-        writer.add_scalar('Comparison/Roll_rate_Diff_rad_s', roll_rate_rad_s - env_roll_rate_rad_s, step)
-        writer.add_scalar('Comparison/Pitch_rate_Diff_rad_s', pitch_rate_rad_s - env_pitch_rate_rad_s, step)
-        writer.add_scalar('Comparison/Yaw_rate_Diff_rad_s', yaw_rate_rad_s - env_yaw_rate_rad_s, step)
+
+        section_after_state = time.perf_counter()
+        timing_records['03_state_update_ms'].append((iteration, (section_after_state - section_after_mavlink) * 1000.0))
         
         # ==================== Print Progress ====================
-        if step % 50 == 0:
-            print(f"Step {step:4d} | "
-                  f"Dist: {distance:6.3f}m (EnvSim: {env_distance:6.3f}m) | "
-                  f"Height: {height:5.2f}m (EnvSim: {env_height:5.2f}m) | "
+        if step_idx % 50 == 0:
+            print(f"Step {step_idx:4d} (ulog#{global_command_idx:3d}) | "
+                  f"Dist: {distance:6.3f}m | "
+                  f"Height: {height:5.2f}m | "
                   f"Speed: {speed:5.2f}m/s | "
-                  f"Angle: {angle_to_target:5.1f}° (EnvSim: {env_angle:5.1f}°) | "
-                  f"Reward: {reward:7.3f} (EnvSim: {float(env_reward):7.3f})")
+                  f"Angle: {angle_to_target:5.1f}° | "
+                  f"Reward: {reward:7.3f}")
         
         # ==================== Timing ====================
         step_end_time = time.perf_counter()
         elapsed_time = step_end_time - step_start_time
         sleep_time = dt - elapsed_time
         
+        section_after_logging = time.perf_counter()
+        timing_records['04_logging_prepare_ms'].append((iteration, (section_after_logging - section_after_state) * 1000.0))
+
+        if step_idx < 15:
+            print(
+                f"[TIMING] step={step_idx} "
+                f"debug={timing_records['00_debug_print_ms'][-1][1]:6.2f} ms | "
+                f"policy={timing_records['01_policy_selection_ms'][-1][1]:6.2f} ms | "
+                f"mavlink={timing_records['02_mavlink_send_ms'][-1][1]:6.2f} ms | "
+                f"state={timing_records['03_state_update_ms'][-1][1]:6.2f} ms | "
+                f"log_prep={timing_records['04_logging_prepare_ms'][-1][1]:6.2f} ms | "
+                f"total={elapsed_time * 1000.0:6.2f} ms"
+            )
+
+        # 记录所有step到TensorBoard
+        step_log_queue.append({
+            'step_idx': step_idx,
+            'global_command_idx': global_command_idx,
+            'distance': distance,
+            'height': height,
+            'speed': speed,
+            'angle_to_target': angle_to_target,
+            'reward': reward,
+            'quad_pos': np.asarray(quad_pos),
+            'quad_vel': np.asarray(quad_vel),
+            'attitude_deg': (
+                float(attitude.roll_deg),
+                float(attitude.pitch_deg),
+                float(attitude.yaw_deg),
+            ),
+            'quad_omega': np.asarray(quad_omega),
+            'thrust_normalized': thrust_normalized,
+            'roll_rate_rad_s': roll_rate_rad_s,
+            'pitch_rate_rad_s': pitch_rate_rad_s,
+            'yaw_rate_rad_s': yaw_rate_rad_s,
+            'network_output': np.asarray(current_network_output)
+            if current_network_output is not None
+            else None,
+            'obs_normalized': np.asarray(obs_normalized),
+            'target_pos': np.asarray(target_pos),
+            'loop_duration_ms': elapsed_time * 1000.0,
+            'loop_sleep_ms': max(sleep_time, 0.0) * 1000.0,
+        })
+
         if sleep_time > 0:
             await asyncio.sleep(sleep_time)
+
+        # 跳过step 0的警告（JAX warmup后可能还有少量开销）
+        if step_idx > 0 and elapsed_time > dt * 1.2:
+            print(f"[WARN] Control loop lag at step {step_idx}: {elapsed_time * 1000.0:.2f} ms (target {dt * 1000.0:.2f} ms)")
         
         # ==================== Check Termination ====================
         if distance > 100.0:
@@ -827,28 +856,123 @@ async def run():
             print(f"\n❌ Episode terminated: height out of bounds ({height:.1f}m)")
             break
     
+    logged_steps = len(step_log_queue)
+    last_log = step_log_queue[-1] if logged_steps > 0 else None
+
+    for log in step_log_queue:
+        step_idx = log['step_idx']
+        global_cmd_idx = log['global_command_idx']
+        
+        # 记录全局命令索引以对齐ulog
+        tb_scalars['Debug/Global_Command_Index'].append((step_idx, global_cmd_idx))
+
+        tb_scalars['Metrics/Distance'].append((step_idx, log['distance']))
+        tb_scalars['Metrics/Height'].append((step_idx, log['height']))
+        tb_scalars['Metrics/Speed'].append((step_idx, log['speed']))
+        tb_scalars['Metrics/Angle_to_Target'].append((step_idx, log['angle_to_target']))
+        tb_scalars['Metrics/Reward'].append((step_idx, log['reward']))
+
+        quad_pos = log['quad_pos']
+        quad_vel = log['quad_vel']
+        quad_omega = log['quad_omega']
+
+        tb_scalars['Position/North'].append((step_idx, float(quad_pos[0])))
+        tb_scalars['Position/East'].append((step_idx, float(quad_pos[1])))
+        tb_scalars['Position/Down'].append((step_idx, float(quad_pos[2])))
+
+        tb_scalars['Velocity/North'].append((step_idx, float(quad_vel[0])))
+        tb_scalars['Velocity/East'].append((step_idx, float(quad_vel[1])))
+        tb_scalars['Velocity/Down'].append((step_idx, float(quad_vel[2])))
+
+        roll_deg, pitch_deg, yaw_deg = log['attitude_deg']
+        tb_scalars['Attitude/Roll_deg'].append((step_idx, roll_deg))
+        tb_scalars['Attitude/Pitch_deg'].append((step_idx, pitch_deg))
+        tb_scalars['Attitude/Yaw_deg'].append((step_idx, yaw_deg))
+
+        tb_scalars['Angular_Velocity/Yaw_rad_s'].append((step_idx, float(quad_omega[2])))
+
+        tb_scalars['Action/Thrust_normalized'].append((step_idx, log['thrust_normalized']))
+        tb_scalars['Action/Roll_rate_rad_s'].append((step_idx, log['roll_rate_rad_s']))
+        tb_scalars['Action/Pitch_rate_rad_s'].append((step_idx, log['pitch_rate_rad_s']))
+        tb_scalars['Action/Yaw_rate_rad_s'].append((step_idx, log['yaw_rate_rad_s']))
+
+        network_output = log['network_output']
+        if network_output is not None:
+            tb_scalars['Network_Output/Thrust_raw'].append((step_idx, float(network_output[0])))
+            tb_scalars['Network_Output/Roll_rate_raw'].append((step_idx, float(network_output[1])))
+            tb_scalars['Network_Output/Pitch_rate_raw'].append((step_idx, float(network_output[2])))
+            tb_scalars['Network_Output/Yaw_rate_raw'].append((step_idx, float(network_output[3])))
+
+        obs_host = log['obs_normalized']
+        if obs_host.shape[0] >= 3:
+            tb_scalars['Network_Input/Current_Obs_Vx'].append((step_idx, float(obs_host[0])))
+            tb_scalars['Network_Input/Current_Obs_Vy'].append((step_idx, float(obs_host[1])))
+            tb_scalars['Network_Input/Current_Obs_Vz'].append((step_idx, float(obs_host[2])))
+        if obs_host.shape[0] >= 6:
+            tb_scalars['Network_Input/Current_Obs_Gx'].append((step_idx, float(obs_host[3])))
+            tb_scalars['Network_Input/Current_Obs_Gy'].append((step_idx, float(obs_host[4])))
+            tb_scalars['Network_Input/Current_Obs_Gz'].append((step_idx, float(obs_host[5])))
+        if obs_host.shape[0] >= 9:
+            tb_scalars['Network_Input/Current_Obs_TargetX'].append((step_idx, float(obs_host[6])))
+            tb_scalars['Network_Input/Current_Obs_TargetY'].append((step_idx, float(obs_host[7])))
+            tb_scalars['Network_Input/Current_Obs_TargetZ'].append((step_idx, float(obs_host[8])))
+        for i in range(9, obs_host.shape[0]):
+            tb_scalars[f'Network_Input/Current_Obs_Dim{i}'].append((step_idx, float(obs_host[i])))
+
+        target_pos = log['target_pos']
+        tb_scalars['Target/North'].append((step_idx, float(target_pos[0])))
+        tb_scalars['Target/East'].append((step_idx, float(target_pos[1])))
+        tb_scalars['Target/Down'].append((step_idx, float(target_pos[2])))
+
+        tb_scalars['Loop/Step_Duration_ms'].append((step_idx, log['loop_duration_ms']))
+        tb_scalars['Loop/Sleep_Time_ms'].append((step_idx, log['loop_sleep_ms']))
+        
+        # Angular velocity for all axes
+        tb_scalars['Angular_Velocity/Roll_rad_s'].append((step_idx, float(quad_omega[0])))
+        tb_scalars['Angular_Velocity/Pitch_rad_s'].append((step_idx, float(quad_omega[1])))
+    # ==================== Transition to Position Hold ====================
+    latest_attitude = latest_state.get("attitude")
+    hold_yaw_deg = float(latest_attitude.yaw_deg) if latest_attitude is not None else 0.0
+
+    latest_odometry = latest_state.get("odometry")
+    if latest_odometry is not None:
+        hold_north = float(latest_odometry.position_body.x_m)
+        hold_east = float(latest_odometry.position_body.y_m)
+        hold_down = float(latest_odometry.position_body.z_m)
+    else:
+        hold_north = 0.0
+        hold_east = 0.0
+        hold_down = -target_height
+
+    print("-- Holding current position")
+    for _ in range(50):
+        await drone.offboard.set_position_ned(
+            PositionNedYaw(
+                north_m=hold_north,
+                east_m=hold_east,
+                down_m=hold_down,
+                yaw_deg=hold_yaw_deg,
+            )
+        )
+        await asyncio.sleep(0.05)
+
     # ==================== Cleanup ====================
     print(f"\n{'='*60}")
     print(f"Test episode completed!")
-    print(f"Total steps: {step + 1}")
-    print(f"Final distance (SITL): {distance:.3f}m")
-    print(f"Final height (SITL): {height:.3f}m")
-    print(f"Final distance (EnvSim): {env_distance:.3f}m")
-    print(f"Final height (EnvSim): {env_height:.3f}m")
+    print(f"Total logged steps: {logged_steps}")
+    if logged_steps > 0:
+        print(f"Final distance: {last_log['distance']:.3f}m")
+        print(f"Final height: {last_log['height']:.3f}m")
     print(f"{'='*60}\n")
     
     telemetry_task.cancel()
     attitude_task.cancel()
     
+    for tag, entries in tb_scalars.items():
+        for step_idx, value in entries:
+            writer.add_scalar(tag, value, step_idx)
+
     writer.close()
-    
-    # Save environment simulation data for comparison
-    output_dir = 'aquila/output'
-    os.makedirs(output_dir, exist_ok=True)
-    env_sim_data_file = os.path.join(output_dir, 'test_data_comparing.pkl')
-    with open(env_sim_data_file, 'wb') as f:
-        pickle.dump(env_sim_data, f)
-    print(f"✅ Environment simulation data saved to: {env_sim_data_file}")
     
     print(f"✅ TensorBoard logs saved to: {log_path}")
     print(f"   View with: tensorboard --logdir={log_path}\n")
