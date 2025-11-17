@@ -143,51 +143,51 @@ class Quadrotor:
             air_density=1.2,
         )
 
-    @classmethod
-    def from_name(cls, name: str) -> "Quadrotor":
-        dirname = os.path.dirname(__file__)
-        filename = os.path.join(dirname, "quadrotor_files/")
+    # @classmethod
+    # def from_name(cls, name: str) -> "Quadrotor":
+    #     dirname = os.path.dirname(__file__)
+    #     filename = os.path.join(dirname, "quadrotor_files/")
 
-        if name == "example":
-            filename += "example_quad.yaml"
-        else:
-            raise ValueError(f"Unknown quadrotor name: {name}")
+    #     if name == "example":
+    #         filename += "example_quad.yaml"
+    #     else:
+    #         raise ValueError(f"Unknown quadrotor name: {name}")
 
-        return cls.from_yaml(filename)
+    #     return cls.from_yaml(filename)
 
-    @classmethod
-    def from_yaml(cls, path: str) -> "Quadrotor":
-        with open(path) as stream:
-            try:
-                config = yaml.safe_load(stream)
-                return cls.from_dict(config)
-            except yaml.YAMLError as exc:
-                raise exc
+    # @classmethod
+    # def from_yaml(cls, path: str) -> "Quadrotor":
+    #     with open(path) as stream:
+    #         try:
+    #             config = yaml.safe_load(stream)
+    #             return cls.from_dict(config)
+    #         except yaml.YAMLError as exc:
+    #             raise exc
 
-    @classmethod
-    def default_quadrotor(cls) -> "Quadrotor":
-        return cls.from_name("example")
+    # @classmethod
+    # def default_quadrotor(cls) -> "Quadrotor":
+    #     return cls.from_name("example")
 
-    @classmethod
-    def from_dict(cls, config: dict) -> "Quadrotor":
-        return cls(
-            mass=config["mass"],
-            tbm_fr=jnp.array(config["tbm_fr"]),
-            tbm_bl=jnp.array(config["tbm_bl"]),
-            tbm_br=jnp.array(config["tbm_br"]),
-            tbm_fl=jnp.array(config["tbm_fl"]),
-            inertia=jnp.array(config["inertia"]),
-            motor_omega_min=config["motor_omega_min"],
-            motor_omega_max=config["motor_omega_max"],
-            motor_tau=config["motor_tau"],
-            motor_inertia=config["motor_inertia"],
-            omega_max=jnp.array(config["omega_max"]),
-            thrust_map=jnp.array(config["thrust_map"]),
-            kappa=config["kappa"],
-            thrust_min=config["thrust_min"],
-            thrust_max=config["thrust_max"],
-            rotors_config=config["rotors_config"],
-        )
+    # @classmethod
+    # def from_dict(cls, config: dict) -> "Quadrotor":
+    #     return cls(
+    #         mass=config["mass"],
+    #         tbm_fr=jnp.array(config["tbm_fr"]),
+    #         tbm_bl=jnp.array(config["tbm_bl"]),
+    #         tbm_br=jnp.array(config["tbm_br"]),
+    #         tbm_fl=jnp.array(config["tbm_fl"]),
+    #         inertia=jnp.array(config["inertia"]),
+    #         motor_omega_min=config["motor_omega_min"],
+    #         motor_omega_max=config["motor_omega_max"],
+    #         motor_tau=config["motor_tau"],
+    #         motor_inertia=config["motor_inertia"],
+    #         omega_max=jnp.array(config["omega_max"]),
+    #         thrust_map=jnp.array(config["thrust_map"]),
+    #         kappa=config["kappa"],
+    #         thrust_min=config["thrust_min"],
+    #         thrust_max=config["thrust_max"],
+    #         rotors_config=config["rotors_config"],
+    #     )
 
     @property
     def hovering_motor_speed(self) -> float:
@@ -422,7 +422,7 @@ class Quadrotor:
         base_params: QuadrotorParams, 
         mass: float, 
         key: chex.PRNGKey,
-        thrust_to_weight_min: float = 1.5,
+        thrust_to_weight_min: float = 1.2,
         thrust_to_weight_max: float = 4.0
     ) -> QuadrotorParams:
         """
@@ -457,8 +457,8 @@ class Quadrotor:
         # Randomize maximum angular velocity: ±30% variation around 0.5 rad/s
         # For each axis, omega_max in range [0.35, 0.65] rad/s
         omega_base = 0.5  # rad/s
-        # omega_max = jax.random.uniform(key_omega, shape=(3,), minval=omega_base * 0.7, maxval=omega_base * 1.3)
-        omega_max = jax.random.uniform(key_omega, shape=(3,), minval=0.49, maxval=0.51)
+        omega_max = jax.random.uniform(key_omega, shape=(3,), minval=omega_base * 0.7, maxval=omega_base * 1.3)
+        # omega_max = jax.random.uniform(key_omega, shape=(3,), minval=0.49, maxval=0.51)
         
         # Randomize motor_tau: ±30% fluctuation around the base value
         tau_multiplier = jax.random.uniform(key_tau, minval=0.7, maxval=1.3)

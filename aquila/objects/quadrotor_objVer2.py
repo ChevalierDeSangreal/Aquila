@@ -89,25 +89,21 @@ class Quadrotor:
     def __init__(
             self,
             *,
-            mass=1,  # [kg]
-            tbm_fr=jnp.array([0.15,   0.15, 0.0]),  # [m]
-            tbm_bl=jnp.array([-0.15, -0.15, 0.0]),  # [m]
-            tbm_br=jnp.array([-0.15,  0.15, 0.0]),  # [m]
-            tbm_fl=jnp.array([0.15,  -0.15, 0.0]),  # [m]
-            # tbm_fr=jnp.array([0.04,   0.04, 0.0]),  # [m]
-            # tbm_bl=jnp.array([-0.04, -0.04, 0.0]),  # [m]
-            # tbm_br=jnp.array([-0.04,  0.04, 0.0]),  # [m]
-            # tbm_fl=jnp.array([0.04,  -0.04, 0.0]),  # [m]
-            inertia=jnp.array([0.029125, 0.029125, 0.055225]),  # [kgm^2]
-            motor_omega_min=150.0,  # [rad/s]
-            motor_omega_max=7000.0,  # [rad/s]
-            motor_tau=0.015,  # [s] 减小以匹配SITL的更快响应
-            motor_inertia=2.6e-7,  # [kgm^2]
-            omega_max=jnp.array([0.8, 0.8, 0.6]),  # [rad/s] 增加以匹配SITL的更高机动性
-            thrust_map=jnp.array([2e-7, 0.0,  0.0]),
+            mass=0.248,  # [kg]
+            tbm_fr=jnp.array([0.0825, -0.0825, 0.0]),  # [m]
+            tbm_bl=jnp.array([-0.0825, 0.0825, 0.0]),  # [m]
+            tbm_br=jnp.array([-0.0825, -0.0825, 0.0]),  # [m]
+            tbm_fl=jnp.array([0.0825, 0.0825, 0.0]),  # [m]
+            inertia=jnp.array([0.00026174, 0.00027494, 0.00037511]),  # [kgm^2]
+            motor_omega_min=100.0,  # [rad/s]
+            motor_omega_max=5400.0,  # [rad/s]
+            motor_tau=0.04,  # [s]
+            motor_inertia=2.9265e-7,  # [kgm^2]
+            omega_max=jnp.array([1.0, 1.0, 1.0]),  # [rad/s]
+            thrust_map=jnp.array([2.0e-7, 0.0, 0.0]),
             kappa=0.008,  # [Nm/N]
             thrust_min=0.0,  # [N]
-            thrust_max=9,  # [N] per motor
+            thrust_max=2.5,  # [N] per motor
             rotors_config="cross",
             dt_low_level=0.001,
     ):
