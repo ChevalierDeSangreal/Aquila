@@ -163,8 +163,12 @@ def verify_model_equivalence(tf_model, flax_params, input_dim, hidden_dims, acti
         return None
 
 
-def convert_to_tflite(tf_model, output_path, optimize=True, target_tflite_version='2.14.0'):
-    """将TensorFlow模型转换为TFLite格式"""
+def convert_to_tflite(tf_model, output_path, optimize=False, target_tflite_version='2.14.0'):
+    """将TensorFlow模型转换为TFLite格式
+    
+    注意：optimize 参数会启用量化优化，但是如果没有提供代表性数据集，
+    可能会导致严重的精度损失！建议保持 optimize=False 以确保模型精度。
+    """
     print("\n开始转换为TFLite格式...")
     print(f"  目标TFLite版本: {target_tflite_version}")
     
@@ -178,40 +182,17 @@ def convert_to_tflite(tf_model, output_path, optimize=True, target_tflite_versio
             sample_input = tf.random.normal((1,) + tuple(input_shape[1:]))
             tf_model(sample_input)
     
-    # 使用concrete function方式转换（Keras 3.x推荐方式）
-    # 创建一个输入签名
-    input_shape = tf_model.input_shape
-    input_spec = tf.TensorSpec(shape=input_shape, dtype=tf.float32)
-    
-    # 获取concrete function
-    @tf.function(input_signature=[input_spec])
-    def serving_fn(x):
-        return tf_model(x, training=False)
-    
-    concrete_func = serving_fn.get_concrete_function()
-    
-    # 从concrete function创建转换器
-    converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
-    
-    # 兼容性设置 - 生成与旧版本TFLite兼容的模型
-    # 设置最小运行时版本以确保向后兼容
-    try:
-        converter._experimental_lower_tensor_list_ops = False
-    except AttributeError:
-        pass  # 某些版本可能没有这个属性
-    
-    # 禁用较新的优化以提高兼容性
-    try:
-        converter.experimental_new_converter = False
-    except AttributeError:
-        pass  # 某些版本可能没有这个属性
+    # 使用 from_keras_model 方式转换（推荐方式，更可靠）
+    print("  使用 from_keras_model 转换器...")
+    converter = tf.lite.TFLiteConverter.from_keras_model(tf_model)
     
     if optimize:
-        # 优化选项
+        # 优化选项 - 警告：可能导致精度损失
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        print("  启用默认优化")
+        print("  ⚠️  启用默认优化（可能导致精度损失）")
+        print("  建议：提供代表性数据集或禁用优化")
     else:
-        print("  禁用优化（更好的兼容性）")
+        print("  ✓ 禁用优化（保持最佳精度）")
     
     # 转换模型
     print("  正在转换模型...")
@@ -348,8 +329,8 @@ def main():
     output_dir = 'aquila/param/tflite'
     tflite_path = os.path.join(output_dir, 'trackVer8_policy_stabler.tflite')
     
-    # 是否启用优化
-    optimize = True
+    # 是否启用优化（警告：启用优化可能导致严重的精度损失！）
+    optimize = False  # 建议保持 False 以确保模型精度
     
     print("=" * 60)
     print("JAX/Flax to TFLite Converter")

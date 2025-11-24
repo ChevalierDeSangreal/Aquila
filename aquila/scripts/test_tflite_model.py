@@ -11,8 +11,51 @@ import sys
 import numpy as np
 import tensorflow as tf
 import time
+import re
 
-def test_tflite_model(model_path, num_tests=10):
+
+def load_input_from_tmplog(tmplog_path):
+    """从tmplog.txt文件中加载输入数据"""
+    if not os.path.exists(tmplog_path):
+        print(f"⚠️  Warning: tmplog file not found at {tmplog_path}")
+        return None
+    
+    with open(tmplog_path, 'r') as f:
+        lines = f.readlines()
+    
+    # 解析第一行的完整输入数组
+    if len(lines) < 1:
+        print("⚠️  Warning: tmplog file is empty")
+        return None
+    
+    first_line = lines[0].strip()
+    if first_line.startswith("Full input array:"):
+        # 从第二行或同一行提取数据
+        data_line = first_line.replace("Full input array:", "").strip()
+        if not data_line and len(lines) > 1:
+            data_line = lines[1].strip()
+    else:
+        data_line = first_line
+    
+    # 提取所有浮点数
+    # 匹配格式如 +0.581000, -0.085986 等
+    numbers = re.findall(r'[+-]?\d+\.\d+', data_line)
+    
+    if not numbers:
+        print("⚠️  Warning: Could not parse numbers from tmplog file")
+        return None
+    
+    # 转换为numpy数组
+    input_array = np.array([float(num) for num in numbers], dtype=np.float32)
+    
+    print(f"✅ Loaded input data from {tmplog_path}")
+    print(f"   Input dimension: {len(input_array)}")
+    print(f"   First 5 values: {input_array[:5]}")
+    
+    return input_array
+
+
+def test_tflite_model(model_path, num_tests=10, fixed_input=None):
     """测试TFLite模型"""
     
     print("=" * 60)
@@ -54,6 +97,22 @@ def test_tflite_model(model_path, num_tests=10):
     output_shape = output_details[0]['shape']
     output_dim = output_shape[-1] if len(output_shape) > 1 else output_shape[0]
     
+    # 准备测试输入
+    if fixed_input is not None:
+        if len(fixed_input) != input_dim:
+            print(f"⚠️  Warning: Fixed input dimension ({len(fixed_input)}) doesn't match model input dimension ({input_dim})")
+            print(f"   Adjusting input...")
+            if len(fixed_input) > input_dim:
+                fixed_input = fixed_input[:input_dim]
+            else:
+                # 填充零
+                fixed_input = np.pad(fixed_input, (0, input_dim - len(fixed_input)), mode='constant')
+        test_input_base = fixed_input.reshape(1, input_dim)
+        print(f"✅ Using fixed input from tmplog (dimension: {input_dim})")
+    else:
+        test_input_base = None
+        print(f"⚠️  Using random input (dimension: {input_dim})")
+    
     # 测试推理
     print(f"\nRunning {num_tests} inference tests...")
     
@@ -61,8 +120,11 @@ def test_tflite_model(model_path, num_tests=10):
     outputs = []
     
     for i in range(num_tests):
-        # 生成随机输入
-        test_input = np.random.randn(1, input_dim).astype(np.float32)
+        # 使用固定输入或生成随机输入
+        if test_input_base is not None:
+            test_input = test_input_base
+        else:
+            test_input = np.random.randn(1, input_dim).astype(np.float32)
         
         # 设置输入
         interpreter.set_tensor(input_details[0]['index'], test_input)
@@ -114,7 +176,7 @@ def test_tflite_model(model_path, num_tests=10):
     return True
 
 
-def compare_with_original(tflite_path, pkl_path):
+def compare_with_original(tflite_path, pkl_path, fixed_input=None):
     """比较TFLite模型和原始Flax模型的输出"""
     
     print("\n" + "=" * 60)
@@ -150,14 +212,30 @@ def compare_with_original(tflite_path, pkl_path):
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
     
-    # 生成测试输入
-    print("\nGenerating test inputs...")
-    num_comparisons = 5
+    # 准备测试输入
+    if fixed_input is not None:
+        if len(fixed_input) != input_dim:
+            print(f"⚠️  Warning: Fixed input dimension ({len(fixed_input)}) doesn't match model input dimension ({input_dim})")
+            if len(fixed_input) > input_dim:
+                fixed_input = fixed_input[:input_dim]
+            else:
+                fixed_input = np.pad(fixed_input, (0, input_dim - len(fixed_input)), mode='constant')
+        test_input_base = fixed_input.reshape(1, input_dim)
+        print(f"\n✅ Using fixed input from tmplog for comparison")
+        num_comparisons = 1  # 只需要比较一次，因为输入是固定的
+    else:
+        test_input_base = None
+        print("\nGenerating random test inputs...")
+        num_comparisons = 5
+    
     max_diffs = []
     mean_diffs = []
     
     for i in range(num_comparisons):
-        test_input = np.random.randn(1, input_dim).astype(np.float32)
+        if test_input_base is not None:
+            test_input = test_input_base
+        else:
+            test_input = np.random.randn(1, input_dim).astype(np.float32)
         
         # TFLite推理
         interpreter.set_tensor(input_details[0]['index'], test_input)
@@ -202,24 +280,36 @@ def compare_with_original(tflite_path, pkl_path):
 
 def main():
     # 默认路径
-    tflite_path = 'aquila/param/tflite/trackVer6_policy.tflite'
-    pkl_path = 'aquila/param/trackVer6_policy.pkl'
+    tflite_path = 'aquila/param/tflite/trackVer8_policy_stabler.tflite'
+    pkl_path = 'aquila/param/trackVer8_policy_stabler.pkl'
+    tmplog_path = 'tmplog.txt'
     
     # 命令行参数
     if len(sys.argv) > 1:
         tflite_path = sys.argv[1]
     if len(sys.argv) > 2:
         pkl_path = sys.argv[2]
+    if len(sys.argv) > 3:
+        tmplog_path = sys.argv[3]
+    
+    # 加载固定输入
+    print("=" * 60)
+    print("Loading test input data")
+    print("=" * 60)
+    fixed_input = load_input_from_tmplog(tmplog_path)
+    if fixed_input is None:
+        print("⚠️  Warning: Using random inputs instead")
+    print()
     
     # 测试TFLite模型
-    success = test_tflite_model(tflite_path, num_tests=100)
+    success = test_tflite_model(tflite_path, num_tests=100, fixed_input=fixed_input)
     
     if not success:
         sys.exit(1)
     
     # 如果原始模型存在，进行比较
     if os.path.exists(pkl_path):
-        compare_with_original(tflite_path, pkl_path)
+        compare_with_original(tflite_path, pkl_path, fixed_input=fixed_input)
     else:
         print(f"\n⚠️  Original model not found at {pkl_path}, skipping comparison")
     
