@@ -6,7 +6,7 @@ import sys
 
 # ==================== GPU Configuration ====================
 # 必须在导入JAX之前设置CUDA_VISIBLE_DEVICES
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'  # 使用单张GPU
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # 使用单张GPU
 os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/usr/local/cuda'
 
 import time
@@ -21,10 +21,10 @@ import pickle
 from torch.utils.tensorboard import SummaryWriter
 
 # Add parent directory to path for imports
-# aquila/scripts/train_trackVer9.py -> ../../ -> Aquila project root
+# aquila/scripts/train_hoverVer0.py -> ../../ -> Aquila project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.target_trackVer9 import TrackEnvVer9  # 使用TrackEnvVer9（基于Ver8，使用QuadrotorVer2支持PID参数随机化）
+from aquila.envs.hoverVer0 import HoverEnvVer0  # 使用HoverEnvVer0（基于TrackVer9，悬停任务，使用QuadrotorVer2支持PID参数随机化）
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
 from aquila.algos import bptt
@@ -62,23 +62,21 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Environment Setup ====================
-    # Create env - 使用TrackEnvVer9环境（基于Ver8，使用QuadrotorVer2支持PID参数随机化）
-    env = TrackEnvVer9(
-        max_steps_in_episode=1000,  # 追踪任务的最大步数
+    # Create env - 使用HoverEnvVer0环境（基于TrackVer9，悬停任务，使用QuadrotorVer2支持PID参数随机化）
+    env = HoverEnvVer0(
+        max_steps_in_episode=1000,  # 悬停任务的最大步数
         dt=0.01,  # 使用完整四旋翼的默认时间步长
         delay=0.03,  # 可选执行延迟
         omega_std=0.1,
-        action_penalty_weight=0.5,
-        # Tracking specific parameters
-        target_height=2.0,  # m (高度2米，实际会在(-2.2, -1.8)范围内随机)
-        target_init_distance_min=0.5,  # m (x轴上的初始距离最小值)
-        target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
-        target_speed_max=1.0,  # m/s (目标最大速度上限，实际每episode会在0-1之间随机)
-        reset_distance=100.0,  # m (重置距离阈值)
+        action_penalty_weight=0.1,
+        # Hovering specific parameters
+        hover_height=2.0,  # m (悬停高度2米)
+        init_pos_range=0.5,  # m (初始位置随机化范围，实际在0~0.5m球体内随机)
+        max_distance=10.0,  # m (距离原点最大距离阈值，超过则重置)
         max_speed=20.0,  # m/s
         # Parameter randomization (quadrotor)
         thrust_to_weight_min=1.2,  # 最小推重比
-        thrust_to_weight_max=3.0,  # 最大推重比
+        thrust_to_weight_max=5.0,  # 最大推重比
     )
     
     # Normalize obs to [-1,1] and actions to [-1,1]
@@ -137,7 +135,7 @@ def main():
         print("✅ 使用初始网络参数开始训练")
     else:
         # 使用加载的参数
-        policy_file = 'aquila/param/trackVer9_policy.pkl'  # 使用Ver9的模型文件
+        policy_file = 'aquila/param/hoverVer0_policy.pkl'  # 使用hoverVer0的模型文件
         loaded_params, env_config = load_trained_policy(policy_file)
         train_state = TrainState.create(
             apply_fn=policy.apply,
@@ -148,7 +146,7 @@ def main():
     
     # ==================== TensorBoard Setup ====================
     # 创建tensorboard日志目录
-    log_dir = f'runs/trackVer9_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用Ver9的日志目录
+    log_dir = f'runs/hoverVer0_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用hoverVer0的日志目录
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard logs will be saved to: {log_dir}")
     print(f"Run 'tensorboard --logdir=runs' to view training progress")
@@ -161,7 +159,7 @@ def main():
     training_log = []
     
     print(f"\n{'='*60}")
-    print(f"开始训练追踪任务 (TrackVer9 - 使用QuadrotorVer2支持PID参数随机化)...")
+    print(f"开始训练悬停任务 (HoverVer0 - 基于TrackVer9，使用QuadrotorVer2支持PID参数随机化)...")
     print(f"Total environments: {num_envs}")
     print(f"Number of epochs: {num_epochs}")
     print(f"Steps per epoch: {env.max_steps_in_episode}")
@@ -233,7 +231,7 @@ def main():
     
     # ==================== Print Summary ====================
     print(f"\n{'='*60}")
-    print(f"追踪任务训练完成！(TrackVer9 - 使用QuadrotorVer2支持PID参数随机化)")
+    print(f"悬停任务训练完成！(HoverVer0 - 基于TrackVer9，使用QuadrotorVer2支持PID参数随机化)")
     print(f"{'='*60}")
     print(f"Training time: {training_time:.2f} seconds ({training_time/60:.2f} minutes)")
     print(f"Final Loss: {final_loss:.6f}")
@@ -263,12 +261,10 @@ def main():
             'dt': env.dt,
             'delay': env.delay,
             'action_penalty_weight': env.action_penalty_weight,
-            # Ver9 基于Ver8，使用QuadrotorVer2：目标位置y和z随机，roll/pitch随机，目标速度每episode随机，PID参数随机化
-            'target_height': env.target_height,
-            'target_init_distance_min': env.target_init_distance_min,
-            'target_init_distance_max': env.target_init_distance_max,
-            'target_speed_max': env.target_speed_max,
-            'reset_distance': env.reset_distance,
+            # HoverVer0 基于TrackVer9，使用QuadrotorVer2：悬停任务，初始位置在0~0.5m球体内随机，姿态和速度完全随机，PID参数随机化
+            'hover_height': env.hover_height,
+            'init_pos_range': env.init_pos_range,
+            'max_distance': env.max_distance,
             'max_speed': env.max_speed,
         }
     }
@@ -277,14 +273,14 @@ def main():
     os.makedirs('aquila/param', exist_ok=True)
     
     # 保存为pickle文件
-    checkpoint_path = 'aquila/param/trackVer9_policy.pkl'  # 使用Ver9的文件名
+    checkpoint_path = 'aquila/param/hoverVer0_policy.pkl'  # 使用hoverVer0的文件名
     with open(checkpoint_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
-    print(f"\n✅ Trained tracking policy saved as: {checkpoint_path}")
+    print(f"\n✅ Trained hovering policy saved as: {checkpoint_path}")
     
     # 额外保存一个带时间戳的备份
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = f'aquila/param/trackVer9_policy_{timestamp}.pkl'  # 使用Ver9的文件名
+    backup_path = f'aquila/param/hoverVer0_policy_{timestamp}.pkl'  # 使用hoverVer0的文件名
     with open(backup_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"✅ Backup saved as: {backup_path}")
