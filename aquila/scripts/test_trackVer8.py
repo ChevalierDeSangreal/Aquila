@@ -102,7 +102,8 @@ def test_policy():
     """测试训练好的策略"""
     
     # ==================== Load Policy ====================
-    policy_file = 'aquila/param/trackVer8_policy_stabler.pkl'
+    # policy_file = 'aquila/param/trackVer8_policy_stabler.pkl'
+    policy_file = 'aquila/param/trackVer9_policy.pkl'
     params, env_config, action_repeat, buffer_size = load_trained_policy(policy_file)
     
     # ==================== Environment Setup ====================
@@ -119,8 +120,8 @@ def test_policy():
         target_speed_max=1.0,
         reset_distance=100.0,
         max_speed=20.0,
-        thrust_to_weight_min=1.5,
-        thrust_to_weight_max=3.0,
+        thrust_to_weight_min=1.2,
+        thrust_to_weight_max=5.0,
     )
     
     # 应用与训练时相同的wrapper

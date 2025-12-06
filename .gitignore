@@ -15,6 +15,8 @@ runs/* */
 /aquila/test_runs/*
 *output/*
 
+/aquila/output/*
+
 # C extensions
 *.so
 

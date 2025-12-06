@@ -19,7 +19,7 @@ from mpl_toolkits.mplot3d import Axes3D
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.hoverVer0 import HoverEnvVer0, ExtendedQuadrotorParams
+from aquila.envs.hoverVer1 import HoverEnvVer1, ExtendedQuadrotorParams
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
 
@@ -79,12 +79,11 @@ def create_initial_state_at_target(env, key, use_easy_init=False):
         thrust_to_weight_max=env.thrust_to_weight_max
     )
     
-    # 转换为扩展的参数类
+    # 转换为扩展的参数类（hoverVer1使用Quadrotor，不包含Kp参数）
     quad_params = ExtendedQuadrotorParams(
         thrust_max=randomized_params.thrust_max,
         omega_max=randomized_params.omega_max,
         motor_tau=randomized_params.motor_tau,
-        Kp=randomized_params.Kp,
         mass=env.quadrotor._mass,
         gravity=9.81
     )
@@ -95,7 +94,7 @@ def create_initial_state_at_target(env, key, use_easy_init=False):
         p = env.hover_origin
         
         # 设置速度：几乎静止
-        v = jnp.array([0.1, 0.0, 0.0])
+        v = jnp.array([0, 0.0, 0.0])
         
         # 设置姿态为水平（单位旋转矩阵）
         R = jnp.eye(3)
@@ -165,8 +164,8 @@ def create_initial_state_at_target(env, key, use_easy_init=False):
     filtered_thrust = thrust_hover
     
     # 创建state
-    from aquila.envs.hoverVer0 import HoverStateVer0
-    state = HoverStateVer0(
+    from aquila.envs.hoverVer1 import HoverStateVer1
+    state = HoverStateVer1(
         time=0.0,
         step_idx=0,
         quadrotor_state=quadrotor_state,
@@ -277,20 +276,20 @@ def run_episode(env, policy, params, state, max_steps=1000, action_repeat=10, bu
             action_obs_buffer_flat = action_obs_buffer_for_input.reshape(-1)
             current_action = policy.apply(params, action_obs_buffer_flat)
             
-            # # 调试：打印前50个step的网络输入和输出
-            # if step < 50:
-            #     print(f"[DEBUG] Step {step:3d} (获取新动作):")
-            #     with np.printoptions(precision=3, suppress=True):
-            #         # 将缓冲区按每个step分开显示
-            #         action_obs_buffer_array = np.array(action_obs_buffer_for_input)
-            #         for i in range(buffer_size):
-            #             step_action = action_obs_buffer_array[i, :action_dim]
-            #             step_obs = action_obs_buffer_array[i, action_dim:]
-            #             action_str = np.array2string(step_action, separator=', ', max_line_width=1000)
-            #             obs_str = np.array2string(step_obs, separator=', ', max_line_width=1000)
-            #             print(f"  Buffer[{i:2d}] - Action: {action_str} Obs: {obs_str}")
-            #         output_str = np.array2string(np.array(current_action), separator=', ', max_line_width=1000)
-            #         print(f"  Output: {output_str}")
+            # 调试：打印前50个step的网络输入和输出
+            if step < 50:
+                print(f"[DEBUG] Step {step:3d} (获取新动作):")
+                with np.printoptions(precision=3, suppress=True):
+                    # 将缓冲区按每个step分开显示
+                    action_obs_buffer_array = np.array(action_obs_buffer_for_input)
+                    for i in range(buffer_size):
+                        step_action = action_obs_buffer_array[i, :action_dim]
+                        step_obs = action_obs_buffer_array[i, action_dim:]
+                        action_str = np.array2string(step_action, separator=', ', max_line_width=1000)
+                        obs_str = np.array2string(step_obs, separator=', ', max_line_width=1000)
+                        print(f"  Buffer[{i:2d}] - Action: {action_str} Obs: {obs_str}")
+                    output_str = np.array2string(np.array(current_action), separator=', ', max_line_width=1000)
+                    print(f"  Output: {output_str}")
             
             # 步骤3：用新动作+当前观测更新缓冲区（与训练时一致：从原始缓冲区roll）
             # ⚠️ 修复：从原始action_obs_buffer roll，而不是从步骤1的结果roll
@@ -317,7 +316,11 @@ def run_episode(env, policy, params, state, max_steps=1000, action_repeat=10, bu
         
         # 检查终止条件
         if terminated or truncated:
-            print(f"Episode terminated at step {step}")
+            if terminated:
+                distance = float(jnp.linalg.norm(state.quadrotor_state.p - state.hover_origin))
+                print(f"Episode TERMINATED at step {step} (distance to origin: {distance:.4f} m > max_distance: {env.unwrapped.max_distance} m)")
+            elif truncated:
+                print(f"Episode TRUNCATED at step {step} (reached max_steps: {env.unwrapped.max_steps_in_episode})")
             break
     
     # 转换为numpy数组
@@ -501,12 +504,12 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Load Policy ====================
-    policy_file = 'aquila/param/hoverVer0_policy.pkl'
+    policy_file = 'aquila/param/hoverVer1_policy.pkl'
     params, env_config, action_repeat, buffer_size = load_trained_policy(policy_file)
     
     # ==================== Environment Setup ====================
-    env = HoverEnvVer0(
-        max_steps_in_episode=1000,
+    env = HoverEnvVer1(
+        max_steps_in_episode=2000,
         dt=0.01,
         delay=0.03,
         omega_std=0.1,
@@ -531,7 +534,7 @@ def main():
     policy = MLP([input_dim, 128, 128, action_dim], initial_scale=0.2)
     
     print(f"\n{'='*60}")
-    print(f"Testing HoverVer0 Policy")
+    print(f"Testing HoverVer1 Policy")
     print(f"{'='*60}")
     print(f"Observation dimension: {obs_dim}")
     print(f"Action dimension: {action_dim}")
@@ -540,112 +543,46 @@ def main():
     print(f"Input dimension: {input_dim}")
     print(f"{'='*60}\n")
     
-    # ==================== 测试选项 ====================
-    # 选择测试模式：
-    # - use_easy_init=True: 使用简单初始条件（接近目标点），单次测试
-    # - use_easy_init=False: 使用和训练相同的随机初始条件，多次测试
-    use_easy_init = False  # 改为False来使用训练时的初始化分布
-    num_test_episodes = 5  # 测试episode数量（只在use_easy_init=False时有效）
+    # ==================== 单次测试 ====================
+    print(f"\n{'='*60}")
+    print(f"运行单次测试（使用训练时的随机初始化分布）")
+    print(f"{'='*60}\n")
     
-    if use_easy_init:
-        # ==================== 单次测试（简单初始条件）====================
-        key = jax.random.key(0)
-        state, quad_params = create_initial_state_at_target(env, key, use_easy_init=True)
-        
-        print(f"Initial state created (EASY mode):")
-        print(f"  Position: {state.quadrotor_state.p}")
-        print(f"  Velocity: {state.quadrotor_state.v}")
-        print(f"  Target: {state.hover_origin}")
-        print(f"  Distance to target: {jnp.linalg.norm(state.quadrotor_state.p - state.hover_origin):.6f} m")
-        print(f"  Thrust max: {quad_params.thrust_max:.2f} N")
-        print(f"  Omega max: {quad_params.omega_max}")
-        print()
-        
-        # ==================== Run Episode ====================
-        print("Running test episode (EASY initial condition)...")
-        data = run_episode(
-            env, policy, params, state, 
-            max_steps=1000, 
-            action_repeat=action_repeat,
-            buffer_size=buffer_size
-        )
-        
-        # 计算loss（与训练时一致：负的平均reward）
-        mean_reward = np.mean(data['rewards'])
-        test_loss = -mean_reward
-        
-        print(f"\n✅ Episode completed!")
-        print(f"   Total steps: {len(data['times'])}")
-        print(f"   Duration: {data['times'][-1]:.2f} s")
-        print(f"   Final distance to target: {data['distances'][-1]:.4f} m")
-        print(f"   Final height: {data['heights'][-1]:.4f} m (target: {-data['target_pos'][2]:.4f} m)")
-        print(f"   Mean reward: {mean_reward:.4f}")
-        print(f"   Test loss (负的平均reward): {test_loss:.4f}")
-        
-        all_episode_data = [data]
-    else:
-        # ==================== 多次测试（训练时的随机初始化分布）====================
-        print(f"\n{'='*60}")
-        print(f"运行多次测试（使用训练时的随机初始化分布）")
-        print(f"测试episode数: {num_test_episodes}")
-        print(f"{'='*60}\n")
-        
-        all_episode_data = []
-        all_losses = []
-        
-        for episode_idx in range(num_test_episodes):
-            print(f"\n--- Episode {episode_idx + 1}/{num_test_episodes} ---")
-            
-            # 使用不同的随机key创建初始状态
-            key = jax.random.key(episode_idx)
-            state, quad_params = create_initial_state_at_target(env, key, use_easy_init=False)
-            
-            print(f"Initial state created (RANDOM mode):")
-            print(f"  Position: {state.quadrotor_state.p}")
-            print(f"  Velocity: {state.quadrotor_state.v}")
-            print(f"  Velocity magnitude: {jnp.linalg.norm(state.quadrotor_state.v):.4f} m/s")
-            print(f"  Target: {state.hover_origin}")
-            print(f"  Distance to target: {jnp.linalg.norm(state.quadrotor_state.p - state.hover_origin):.6f} m")
-            print(f"  Thrust max: {quad_params.thrust_max:.2f} N")
-            print(f"  Omega max: {quad_params.omega_max}")
-            
-            # 运行episode
-            print(f"Running episode {episode_idx + 1}...")
-            data = run_episode(
-                env, policy, params, state, 
-                max_steps=1000, 
-                action_repeat=action_repeat,
-                buffer_size=buffer_size
-            )
-            
-            # 计算loss（与训练时一致：负的平均reward）
-            mean_reward = np.mean(data['rewards'])
-            episode_loss = -mean_reward
-            
-            print(f"Episode {episode_idx + 1} completed:")
-            print(f"  Total steps: {len(data['times'])}")
-            print(f"  Duration: {data['times'][-1]:.2f} s")
-            print(f"  Final distance: {data['distances'][-1]:.4f} m")
-            print(f"  Mean reward: {mean_reward:.4f}")
-            print(f"  Episode loss: {episode_loss:.4f}")
-            
-            all_episode_data.append(data)
-            all_losses.append(episode_loss)
-        
-        # 统计所有episode的结果
-        all_losses = np.array(all_losses)
-        print(f"\n{'='*60}")
-        print(f"多次测试统计结果")
-        print(f"{'='*60}")
-        print(f"Episode数量: {num_test_episodes}")
-        print(f"平均Loss: {np.mean(all_losses):.4f}")
-        print(f"Loss标准差: {np.std(all_losses):.4f}")
-        print(f"最小Loss: {np.min(all_losses):.4f}")
-        print(f"最大Loss: {np.max(all_losses):.4f}")
-        print(f"{'='*60}")
-        
-        # 使用第一个episode的数据进行可视化
-        data = all_episode_data[0]
+    # 创建初始状态（使用随机初始化，和训练时一致）
+    key = jax.random.key(0)
+    state, quad_params = create_initial_state_at_target(env, key, use_easy_init=True)
+    
+    print(f"Initial state created:")
+    print(f"  Position: {state.quadrotor_state.p}")
+    print(f"  Velocity: {state.quadrotor_state.v}")
+    print(f"  Velocity magnitude: {jnp.linalg.norm(state.quadrotor_state.v):.4f} m/s")
+    print(f"  Target: {state.hover_origin}")
+    print(f"  Distance to target: {jnp.linalg.norm(state.quadrotor_state.p - state.hover_origin):.6f} m")
+    print(f"  Thrust max: {quad_params.thrust_max:.2f} N")
+    print(f"  Omega max: {quad_params.omega_max}")
+    print()
+    
+    # ==================== Run Episode ====================
+    print("Running test episode...")
+    # 增加max_steps以便观察更长时间的行为（1000步 = 10秒，2000步 = 20秒）
+    data = run_episode(
+        env, policy, params, state, 
+        max_steps=2000,  # 增加到2000步（20秒）
+        action_repeat=action_repeat,
+        buffer_size=buffer_size
+    )
+    
+    # 计算loss（与训练时一致：负的平均reward）
+    mean_reward = np.mean(data['rewards'])
+    test_loss = -mean_reward
+    
+    print(f"\n✅ Episode completed!")
+    print(f"   Total steps: {len(data['times'])}")
+    print(f"   Duration: {data['times'][-1]:.2f} s")
+    print(f"   Final distance to target: {data['distances'][-1]:.4f} m")
+    print(f"   Final height: {data['heights'][-1]:.4f} m (target: {-data['target_pos'][2]:.4f} m)")
+    print(f"   Mean reward: {mean_reward:.4f}")
+    print(f"   Test loss (负的平均reward): {test_loss:.4f}")
     
     # ==================== Save Results ====================
     # 确保输出目录存在
@@ -653,7 +590,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     
     # 保存数据
-    data_path = os.path.join(output_dir, 'test_hoverVer0_data.pkl')
+    data_path = os.path.join(output_dir, 'test_hoverVer1_data.pkl')
     with open(data_path, 'wb') as f:
         pickle.dump(data, f)
     print(f"\n✅ Test data saved to: {data_path}")
@@ -662,11 +599,11 @@ def main():
     print("\nGenerating visualizations...")
     
     # 3D轨迹图
-    trajectory_path = os.path.join(output_dir, 'hoverVer0_trajectory_3d.png')
+    trajectory_path = os.path.join(output_dir, 'hoverVer1_trajectory_3d.png')
     plot_trajectory_3d(data, trajectory_path)
     
     # 数据分析图
-    analysis_path = os.path.join(output_dir, 'hoverVer0_data_analysis.png')
+    analysis_path = os.path.join(output_dir, 'hoverVer1_data_analysis.png')
     plot_data_analysis(data, analysis_path)
     
     print(f"\n{'='*60}")

@@ -147,9 +147,10 @@ def train(
                 hovering_omega_normalized  # (num_envs, 3)
             ], axis=1)  # 形状: (num_envs, 4)
             
-            # 初始化缓冲区，使用归一化的悬停动作
+            # 初始化缓冲区，使用归一化的悬停动作和零状态向量
             # hovering_action_normalized已经是(num_envs, 4)形状，不需要tile
-            action_obs_combined = jnp.concatenate([hovering_action_normalized, obs], axis=1)
+            zero_obs = jnp.zeros_like(obs)  # 使用零向量代替实际观测
+            action_obs_combined = jnp.concatenate([hovering_action_normalized, zero_obs], axis=1)
             action_obs_buffer_init = jnp.tile(action_obs_combined[:, None, :], (1, buffer_size_k, 1))
             
             # 在epoch开始时获取第一个动作（使用填充的缓冲区）
@@ -335,10 +336,11 @@ def train(
         hovering_omega_normalized
     ], axis=1)  # 形状: (num_envs, 4)
     
-    # 创建初始的动作-状态组合：[action, obs]
-    action_obs_combined = jnp.concatenate([hovering_action_normalized, obs], axis=1)
+    # 创建初始的动作-状态组合：[action, zero_obs]
+    zero_obs = jnp.zeros_like(obs)  # 使用零向量代替实际观测
+    action_obs_combined = jnp.concatenate([hovering_action_normalized, zero_obs], axis=1)
     
-    # 初始化缓冲区，用悬停动作和当前观测填充
+    # 初始化缓冲区，用悬停动作和零状态向量填充
     action_obs_buffer_init = jnp.tile(action_obs_combined[:, None, :], (1, buffer_size, 1))
     
     # 获取初始动作（使用填充的缓冲区）
@@ -439,8 +441,9 @@ def train_multi_gpu(
                 hovering_omega_normalized
             ], axis=1)
             
-            # 初始化缓冲区，使用归一化的悬停动作
-            action_obs_combined = jnp.concatenate([hovering_action_normalized, obs], axis=1)
+            # 初始化缓冲区，使用归一化的悬停动作和零状态向量
+            zero_obs = jnp.zeros_like(obs)  # 使用零向量代替实际观测
+            action_obs_combined = jnp.concatenate([hovering_action_normalized, zero_obs], axis=1)
             action_obs_buffer_init = jnp.tile(action_obs_combined[:, None, :], (1, buffer_size_k, 1))
             
             # 在epoch开始时获取第一个动作（使用填充的缓冲区）
@@ -626,8 +629,9 @@ def train_multi_gpu(
             hovering_omega_normalized
         ], axis=1)
         
-        # 初始化缓冲区，使用归一化的悬停动作
-        action_obs_combined = jnp.concatenate([hovering_action_normalized, obs], axis=1)
+        # 初始化缓冲区，使用归一化的悬停动作和零状态向量
+        zero_obs = jnp.zeros_like(obs)  # 使用零向量代替实际观测
+        action_obs_combined = jnp.concatenate([hovering_action_normalized, zero_obs], axis=1)
         action_obs_buffer_init = jnp.tile(action_obs_combined[:, None, :], (1, buffer_size, 1))
         
         # 获取初始动作（使用填充的缓冲区）

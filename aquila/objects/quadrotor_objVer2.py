@@ -97,8 +97,8 @@ class QuadrotorVer2:
             inertia=jnp.array([0.00026174, 0.00027494, 0.00037511]),  # [kgm^2]
             motor_omega_min=100.0,  # [rad/s]
             motor_omega_max=5400.0,  # [rad/s]
-            motor_tau=0.04,  # [s]
-            motor_inertia=2.9265e-7,  # [kgm^2]
+            motor_tau=0.015,  # [s]
+            motor_inertia=2.6e-7,  # [kgm^2]
             omega_max=jnp.array([1.0, 1.0, 1.0]),  # [rad/s]
             thrust_map=jnp.array([2.0e-7, 0.0, 0.0]),
             kappa=0.008,  # [Nm/N]
@@ -420,10 +420,11 @@ class QuadrotorVer2:
         motor_tau = base_params.motor_tau * tau_multiplier
         
         # Randomize Kp Ver2: multiplier in range [1.0, 3.0] applied to base [20, 20, 10]
-        Kp_base = jnp.array([56.0, 56.0, 28.0])
-        Kp_multiplier = jax.random.uniform(key_kp, minval=1.0, maxval=1.1)
-        Kp = Kp_base * Kp_multiplier
-        
+        # Kp_base = jnp.array([56.0, 56.0, 28.0])
+        # Kp_multiplier = jax.random.uniform(key_kp, minval=1.0, maxval=1.1)
+        # Kp = Kp_base * Kp_multiplier
+        Kp = jnp.array([60.0, 60.0, 30.0])
+
         return QuadrotorParams(
             thrust_max=thrust_max,
             omega_max=omega_max,

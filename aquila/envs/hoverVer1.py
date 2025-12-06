@@ -1,14 +1,14 @@
 """
-Hover Environment Version 0
+Hover Environment Version 1
 Full quadrotor hovering environment at the origin.
-Ver0 modifications: Based on TrackVer9, now focuses on hovering at origin:
-- No target object - drone should hover at origin (0, 0, -2.0)
+Ver1 modifications: Based on HoverVer0, but uses Quadrotor (obj) instead of QuadrotorVer2:
+- No Kp parameter randomization (uses standard Quadrotor)
 - Drone initial position: randomized within a ball of radius 0.5m around origin
 - Drone initial orientation: roll, pitch, yaw fully randomized
-- Drone initial velocity: random direction, magnitude in [0, 2] m/s
+- Drone initial velocity: random direction, magnitude in [0, 1] m/s
 - Drone initial angular velocity: randomized within max angular velocity limits
 - Observation includes relative position to origin instead of target
-- Uses QuadrotorVer2 with PID control parameter randomization support
+- Uses Quadrotor with parameter randomization support (no PID Kp randomization)
 
 Uses NED (North-East-Down) coordinate system:
 - X axis: North (positive forward)
@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import jax_dataclasses as jdc
 
-from aquila.objects.quadrotor_objVer2 import QuadrotorVer2, QuadrotorState, QuadrotorParams
+from aquila.objects.quadrotor_obj import Quadrotor, QuadrotorState, QuadrotorParams
 from aquila.objects.world_box_obj import WorldBox
 from aquila.utils import spaces
 from aquila.utils.pytrees import field_jnp
@@ -37,15 +37,15 @@ import dataclasses
 
 @jdc.pytree_dataclass
 class ExtendedQuadrotorParams(QuadrotorParams):
-    """扩展的QuadrotorParams Ver2，包含mass、gravity和external_force以便支持动态扰动
-    继承自QuadrotorParams Ver2，包含Kp (PID比例增益)参数"""
+    """扩展的QuadrotorParams，包含mass、gravity和external_force以便支持动态扰动
+    继承自QuadrotorParams（不包含Kp参数）"""
     mass: float = 1.0  # [kg]
     gravity: float = 9.81  # [m/s^2]
     external_force: jax.Array = field_jnp([0.0, 0.0, 0.0])  # [N] 外部作用力（如风力）
 
 
 @jdc.pytree_dataclass
-class HoverStateVer0:
+class HoverStateVer1:
     time: float
     step_idx: int
     quadrotor_state: QuadrotorState
@@ -80,8 +80,8 @@ def safe_norm(x, eps=1e-8):
     return jnp.sqrt(jnp.sum(x * x) + eps)
 
 
-class HoverEnvVer0(env_base.Env[HoverStateVer0]):
-    """Quadrotor hovering environment Ver0 - hover at origin, based on TrackVer9 but with QuadrotorVer2 and PID parameter randomization."""
+class HoverEnvVer1(env_base.Env[HoverStateVer1]):
+    """Quadrotor hovering environment Ver1 - hover at origin, based on HoverVer0 but with Quadrotor (no Kp randomization)."""
     
     def __init__(
         self,
@@ -99,7 +99,7 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         max_speed=20.0,  # m/s
         # Parameter randomization (quadrotor)
         thrust_to_weight_min=1.2,  # 最小推重比
-        thrust_to_weight_max=3.0,  # 最大推重比
+        thrust_to_weight_max=5.0,  # 最大推重比
     ):
         self.world_box = WorldBox(
             jnp.array([-5000.0, -5000.0, -5000.0]), jnp.array([5000.0, 5000.0, 5000.0])
@@ -109,8 +109,8 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         
         self.omega_std = omega_std
         
-        # quadrotor - 使用完整的四旋翼模型 Ver2（基于agilicious framework，支持PID参数随机化）
-        self.quadrotor = QuadrotorVer2()
+        # quadrotor - 使用完整的四旋翼模型（基于agilicious framework，不包含PID Kp参数随机化）
+        self.quadrotor = Quadrotor()
         
         # 获取四旋翼参数
         default_params = self.quadrotor.default_params()
@@ -147,7 +147,7 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         self.thrust_to_weight_max = thrust_to_weight_max
 
     def reset(
-        self, key: chex.PRNGKey, state: Optional[HoverStateVer0] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
+        self, key: chex.PRNGKey, state: Optional[HoverStateVer1] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
         """Reset environment with hovering-specific initialization.
         
         Randomization:
@@ -170,21 +170,20 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         
         # 获取quadrotor参数（如果没有提供则使用默认参数）
         if quad_params is None:
-            # 启用参数随机化（质量固定，推力、角速度、PID参数随机化）
+            # 启用参数随机化（质量固定，推力、角速度参数随机化，不包含PID Kp参数）
             base_params = self.quadrotor.default_params()
-            randomized_params = QuadrotorVer2.randomize_params(
+            randomized_params = Quadrotor.randomize_params(
                 base_params,
-                self.quadrotor._mass,  # QuadrotorVer2.randomize_params 需要 mass 参数
+                self.quadrotor._mass,  # Quadrotor.randomize_params 需要 mass 参数
                 key_randomize,
                 thrust_to_weight_min=self.thrust_to_weight_min,
                 thrust_to_weight_max=self.thrust_to_weight_max
             )
-            # 转换为扩展的参数类，添加mass和gravity，保留Kp参数（Ver2新增）
+            # 转换为扩展的参数类，添加mass和gravity（不包含Kp参数）
             quad_params = ExtendedQuadrotorParams(
                 thrust_max=randomized_params.thrust_max,
                 omega_max=randomized_params.omega_max,
                 motor_tau=randomized_params.motor_tau,
-                Kp=randomized_params.Kp,  # Ver2: PID比例增益参数
                 mass=self.quadrotor._mass,
                 gravity=9.81
             )
@@ -253,12 +252,12 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         omega = jnp.zeros(3)
 
         # Initialize quadrotor state
-        # QuadrotorVer2.create_state 使用位置参数 p, R, v，其他参数通过 kwargs 传递
+        # Quadrotor.create_state 使用位置参数 p, R, v，其他参数通过 kwargs 传递
         quadrotor_state = self.quadrotor.create_state(p, R, v, omega=omega)
         
         # Calculate hovering action based on current episode's quad_params
         # 悬停推力 = mass * gravity（使用当前episode的实际质量）
-        thrust_hover = self.quadrotor._mass * 9.81  # QuadrotorParams Ver2 不包含 mass 和 gravity，使用实例的 _mass
+        thrust_hover = self.quadrotor._mass * 9.81  # QuadrotorParams 不包含 mass 和 gravity，使用实例的 _mass
         hovering_action = jnp.array([thrust_hover, 0.0, 0.0, 0.0])
         
         # Initialize action history
@@ -267,7 +266,7 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         filtered_acc = jax.device_put(jnp.array([0.0, 0.0, 9.81]))  # NED坐标系，Down为正
         filtered_thrust = jax.device_put(jnp.array(thrust_hover))
 
-        state = HoverStateVer0(
+        state = HoverStateVer1(
             time=0.0,
             step_idx=0,
             quadrotor_state=quadrotor_state,
@@ -281,10 +280,10 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         
         return state, self._get_obs(state)
 
-    def _get_obs(self, state: HoverStateVer0) -> jax.Array:
+    def _get_obs(self, state: HoverStateVer1) -> jax.Array:
         """Get observation from state.
         
-        Ver0修改：基于TrackVer9，将目标位置改为悬停原点
+        Ver1修改：基于HoverVer0，使用Quadrotor（不包含Kp参数）
         
         观测组成：
         1. 无人机机体系自身速度向量 (3)
@@ -319,7 +318,7 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _step(
-        self, state: HoverStateVer0, action: jax.Array, key: chex.PRNGKey
+        self, state: HoverStateVer1, action: jax.Array, key: chex.PRNGKey
     ) -> EnvTransition:
         # 保存原始action (tanh输出为[-1,1]范围)
         action_raw = action
@@ -357,12 +356,12 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         dt_1 = self.delay % self.dt
         action_1 = last_actions[0]
         f_1, omega_1 = action_1[0], action_1[1:]
-        # 直接传递ExtendedQuadrotorParams（包含mass、gravity、external_force、Kp）
-        # QuadrotorVer2的step方法现在支持ExtendedQuadrotorParams（包含Kp参数）
+        # 直接传递ExtendedQuadrotorParams（包含mass、gravity、external_force，不包含Kp）
+        # Quadrotor的step方法支持ExtendedQuadrotorParams（不包含Kp参数）
         quadrotor_state = self.quadrotor.step(
             state.quadrotor_state, f_1, omega_1, dt_1, 
             drag_params=None,  # 使用默认drag_params
-            quad_params=state.quad_params  # 使用ExtendedQuadrotorParams（Ver2包含Kp）
+            quad_params=state.quad_params  # 使用ExtendedQuadrotorParams（不包含Kp）
         )
 
         if self.delay > 0:
@@ -373,7 +372,7 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
             quadrotor_state = self.quadrotor.step(
                 quadrotor_state, f_2, omega_2, dt_2,
                 drag_params=None,  # 使用默认drag_params
-                quad_params=state.quad_params  # 使用ExtendedQuadrotorParams（Ver2包含Kp）
+                quad_params=state.quad_params  # 使用ExtendedQuadrotorParams（不包含Kp）
             )
 
         # 更新滤波值
@@ -430,7 +429,7 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         )
 
     def _compute_reward(
-        self, last_state: HoverStateVer0, next_state: HoverStateVer0
+        self, last_state: HoverStateVer1, next_state: HoverStateVer1
     ) -> jax.Array:
         """计算奖励 - 悬停任务奖励函数
         奖励设计：
@@ -440,6 +439,7 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         4. 姿态损失：基于机体z轴方向的惩罚
         5. 动作损失：当前动作与上一动作的L2范数
         6. 角速度损失：惩罚旋转运动
+        7. 推力超限损失：动作推力与悬停推力的L2范数
         """
         # 获取状态信息
         quad_pos = next_state.quadrotor_state.p
@@ -499,6 +499,18 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         omega_error = safe_norm(quad_omega, eps=1e-8)
         omega_loss = jnp.exp(omega_error) - 1.0  # 指数增长
         
+        # 7. 推力超限损失 - 约束推力，动作推力与悬停推力的L2范数
+        # 使用当前动作（归一化后的值），需要去归一化
+        thrust_normalized = action_current[0]
+        # 去归一化推力：[-1, 1] -> [thrust_min*4, thrust_max*4]
+        actual_thrust_max = next_state.quad_params.thrust_max
+        action_thrust = 0.5 * (thrust_normalized + 1.0) * (actual_thrust_max * 4 - self.thrust_min * 4) + self.thrust_min * 4
+        # 计算悬停推力：mass * gravity
+        thrust_hover = next_state.quad_params.mass * next_state.quad_params.gravity
+        # 计算推力偏差的L2范数（对于标量，L2范数就是绝对差值）
+        thrust_error = action_thrust - thrust_hover
+        thrust_loss = safe_norm(jnp.array([thrust_error]), eps=1e-8)
+        
         # 总损失 - 悬停任务权重调整
         # - 位置损失：最高权重，确保在原点附近悬停
         # - 高度损失：高权重，保持目标高度
@@ -506,13 +518,15 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
         # - 姿态损失：中等权重，保持水平姿态
         # - 动作损失：低权重，平滑控制
         # - 角速度损失：低权重，减少旋转
+        # - 推力超限损失：中等权重，约束推力接近悬停推力
         total_loss = (
             10 * position_loss +      # 位置损失：最高权重
             100 * height_loss +        # 高度损失：最高权重
             5 * velocity_loss +       # 速度损失：高权重
             10 * ori_loss +           # 姿态损失：中等权重
             80 * action_loss +          # 动作损失：低权重
-            80 * omega_loss             # 角速度损失：低权重
+            80 * omega_loss +           # 角速度损失：低权重
+            50 * thrust_loss            # 推力超限损失：中等权重
         )
         
         # 转换为奖励（负的损失）
@@ -545,7 +559,7 @@ class HoverEnvVer0(env_base.Env[HoverStateVer0]):
     def observation_space(self) -> spaces.Box:
         """Get observation space.
         
-        Ver0修改：基于TrackVer9，改为悬停任务观测空间
+        Ver1修改：基于HoverVer0，使用Quadrotor（不包含Kp参数）
         
         观测组成：
         1. 机体系速度 (3)
@@ -572,7 +586,7 @@ if __name__ == "__main__":
     
     key_gen = key_generator(0)
 
-    env = HoverEnvVer0()
+    env = HoverEnvVer1()
 
     state, obs = env.reset(next(key_gen))
     print(f"Initial observation shape: {obs.shape}")
@@ -589,3 +603,4 @@ if __name__ == "__main__":
     print(f"Reward: {reward}")
     print(f"Distance to origin: {info['distance_to_origin']}")
     print(f"Terminated: {terminated}")
+
