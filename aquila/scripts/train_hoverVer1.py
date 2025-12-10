@@ -77,6 +77,7 @@ def main():
         # Parameter randomization (quadrotor)
         thrust_to_weight_min=1.2,  # 最小推重比
         thrust_to_weight_max=5.0,  # 最大推重比
+        disturbance_mag=2.0,  # 训练时开启常值随机扰动（2N），提高鲁棒性
     )
     
     # Normalize obs to [-1,1] and actions to [-1,1]
@@ -135,7 +136,7 @@ def main():
         print("✅ 使用初始网络参数开始训练")
     else:
         # 使用加载的参数
-        policy_file = 'aquila/param/hoverVer1_policy.pkl'  # 使用hoverVer1的模型文件
+        policy_file = 'aquila/param/hoverVer1_policy_20251206_114727.pkl'  # 使用hoverVer1的模型文件
         loaded_params, env_config = load_trained_policy(policy_file)
         train_state = TrainState.create(
             apply_fn=policy.apply,

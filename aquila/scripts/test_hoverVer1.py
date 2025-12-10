@@ -91,7 +91,7 @@ def create_initial_state_at_target(env, key, use_easy_init=False):
     if use_easy_init:
         # ========== 简单初始条件：接近目标点 ==========
         # 设置位置：直接在目标悬停点
-        p = env.hover_origin
+        p = env.hover_origin + jnp.array([0.0, 0, 0.0])
         
         # 设置速度：几乎静止
         v = jnp.array([0, 0.0, 0.0])
@@ -237,9 +237,13 @@ def run_episode(env, policy, params, state, max_steps=1000, action_repeat=10, bu
     state, obs = env.reset(key, state)
     
     # 初始化动作-状态缓冲区（和训练时保持一致）
+    # 所有位置都使用零观测初始化
     hovering_action_normalized = normalize_hovering_action(env, state)
-    action_obs_combined = jnp.concatenate([hovering_action_normalized, obs])
-    action_obs_buffer = jnp.tile(action_obs_combined[None, :], (buffer_size, 1))
+    zero_obs = jnp.zeros_like(obs)  # 使用零向量代替实际观测
+    
+    # 所有位置：零观测
+    action_obs_combined_zero = jnp.concatenate([hovering_action_normalized, zero_obs])
+    action_obs_buffer = jnp.tile(action_obs_combined_zero[None, :], (buffer_size, 1))
     
     # 获取初始动作（和训练时一致）
     action_obs_buffer_flat = action_obs_buffer.reshape(-1)
@@ -279,7 +283,7 @@ def run_episode(env, policy, params, state, max_steps=1000, action_repeat=10, bu
             # 调试：打印前50个step的网络输入和输出
             if step < 50:
                 print(f"[DEBUG] Step {step:3d} (获取新动作):")
-                with np.printoptions(precision=3, suppress=True):
+                with np.printoptions(precision=6, suppress=True):
                     # 将缓冲区按每个step分开显示
                     action_obs_buffer_array = np.array(action_obs_buffer_for_input)
                     for i in range(buffer_size):
@@ -290,6 +294,27 @@ def run_episode(env, policy, params, state, max_steps=1000, action_repeat=10, bu
                         print(f"  Buffer[{i:2d}] - Action: {action_str} Obs: {obs_str}")
                     output_str = np.array2string(np.array(current_action), separator=', ', max_line_width=1000)
                     print(f"  Output: {output_str}")
+                    
+                    # 打印无人机当前状态
+                    pos = np.array(state.quadrotor_state.p)
+                    vel = np.array(state.quadrotor_state.v)
+                    omega = np.array(state.quadrotor_state.omega)
+                    acc = np.array(state.quadrotor_state.acc)
+                    distance_to_origin = float(jnp.linalg.norm(state.quadrotor_state.p - state.hover_origin))
+                    height = float(-state.quadrotor_state.p[2])  # NED坐标系，z是向下的
+                    
+                    pos_str = np.array2string(pos, separator=', ', max_line_width=1000)
+                    vel_str = np.array2string(vel, separator=', ', max_line_width=1000)
+                    omega_str = np.array2string(omega, separator=', ', max_line_width=1000)
+                    acc_str = np.array2string(acc, separator=', ', max_line_width=1000)
+                    print(f"  Drone State:")
+                    print(f"    Position (p): {pos_str}")
+                    print(f"    Velocity (v): {vel_str}")
+                    print(f"    Angular Vel (omega): {omega_str}")
+                    print(f"    Acceleration (acc): {acc_str}")
+                    print(f"    Distance to origin: {distance_to_origin:.6f} m")
+                    print(f"    Height: {height:.6f} m")
+                    print(f"    Time: {state.time:.6f} s")
             
             # 步骤3：用新动作+当前观测更新缓冲区（与训练时一致：从原始缓冲区roll）
             # ⚠️ 修复：从原始action_obs_buffer roll，而不是从步骤1的结果roll
@@ -504,22 +529,24 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Load Policy ====================
-    policy_file = 'aquila/param/hoverVer1_policy.pkl'
+    policy_file = 'aquila/param/hoverVer1_policy_stable.pkl'
     params, env_config, action_repeat, buffer_size = load_trained_policy(policy_file)
     
     # ==================== Environment Setup ====================
+    # 测试时关闭常值随机扰动（训练时应设置 disturbance_mag > 0，例如 2.0）
     env = HoverEnvVer1(
         max_steps_in_episode=2000,
         dt=0.01,
-        delay=0.03,
+        delay=0.01,
         omega_std=0.1,
         action_penalty_weight=0.1,
         hover_height=2.0,
         init_pos_range=0.5,
         max_distance=10.0,
         max_speed=20.0,
-        thrust_to_weight_min=1.2,
-        thrust_to_weight_max=5.0,
+        thrust_to_weight_min=3.8,
+        thrust_to_weight_max=4.1,
+        disturbance_mag=0.0,  # 测试时关闭扰动
     )
     
     # 应用和训练时相同的wrapper

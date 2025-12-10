@@ -107,6 +107,7 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
         # Parameter randomization (quadrotor)
         thrust_to_weight_min=1.5,  # 最小推重比
         thrust_to_weight_max=3.0,  # 最大推重比
+        disturbance_mag=0.0,  # [N] 常值扰动力大小（训练时>0，测试时=0）
     ):
         self.world_box = WorldBox(
             jnp.array([-5000.0, -5000.0, -5000.0]), jnp.array([5000.0, 5000.0, 5000.0])
@@ -117,7 +118,7 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
         self.omega_std = omega_std
         
         # quadrotor - 使用完整的四旋翼模型（基于agilicious framework）
-        self.quadrotor = Quadrotor(mass=1.0)
+        self.quadrotor = Quadrotor(mass=1.0, disturbance_mag=disturbance_mag)
         
         # 获取四旋翼参数
         default_params = self.quadrotor.default_params()
@@ -159,6 +160,7 @@ class TrackEnvVer5(env_base.Env[TrackStateVer5]):
         # Parameter randomization
         self.thrust_to_weight_min = thrust_to_weight_min
         self.thrust_to_weight_max = thrust_to_weight_max
+        self.disturbance_mag = disturbance_mag
 
     def reset(
         self, key: chex.PRNGKey, state: Optional[TrackStateVer5] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):

@@ -1,12 +1,17 @@
 """
-Track Environment Version 9
-Full quadrotor tracking environment with a moving target.
-Ver9 modifications: Based on Ver8, now uses QuadrotorVer2 with PID control parameter randomization:
-- Target initial position: randomized in x, y (±0.2m), and z (-2.2 to -1.8m)
-- Target max speed: randomized from 0 to 1 m/s per episode
-- Drone initial orientation: roll and pitch randomized within ±15°
-- Removed observation delay - uses true state values directly
-- Uses QuadrotorVer2 with Kp (PID proportional gains) randomization support
+Hover Environment Version 2
+Full quadrotor hovering environment at the origin.
+Ver2 modifications: Based on HoverVer1, with modified reward weight design.
+Ver1 modifications (inherited): Based on HoverVer0, but uses Quadrotor (obj) instead of QuadrotorVer2:
+- No Kp parameter randomization (uses standard Quadrotor)
+- Drone initial position: randomized within a ball of radius 0.5m around origin
+- Drone initial orientation: roll, pitch, yaw fully randomized
+- Drone initial velocity: random direction, magnitude in [0, 1] m/s
+- Drone initial angular velocity: randomized within max angular velocity limits
+- Observation includes relative position to origin instead of target
+- Uses Quadrotor with parameter randomization support (no PID Kp randomization)
+Ver2 specific changes:
+- Modified reward weight design compared to Ver1
 
 Uses NED (North-East-Down) coordinate system:
 - X axis: North (positive forward)
@@ -23,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import jax_dataclasses as jdc
 
-from aquila.objects.quadrotor_objVer2 import QuadrotorVer2, QuadrotorState, QuadrotorParams
+from aquila.objects.quadrotor_obj import Quadrotor, QuadrotorState, QuadrotorParams
 from aquila.objects.world_box_obj import WorldBox
 from aquila.utils import spaces
 from aquila.utils.pytrees import field_jnp
@@ -35,29 +40,24 @@ import dataclasses
 
 @jdc.pytree_dataclass
 class ExtendedQuadrotorParams(QuadrotorParams):
-    """扩展的QuadrotorParams Ver2，包含mass、gravity和external_force以便支持动态扰动
-    继承自QuadrotorParams Ver2，包含Kp (PID比例增益)参数"""
+    """扩展的QuadrotorParams，包含mass、gravity和external_force以便支持动态扰动
+    继承自QuadrotorParams（不包含Kp参数）"""
     mass: float = 1.0  # [kg]
     gravity: float = 9.81  # [m/s^2]
     external_force: jax.Array = field_jnp([0.0, 0.0, 0.0])  # [N] 外部作用力（如风力）
 
 
 @jdc.pytree_dataclass
-class TrackStateVer9:
+class HoverStateVer2:
     time: float
     step_idx: int
     quadrotor_state: QuadrotorState
     last_actions: jax.Array
-    target_pos: jax.Array
-    target_vel: jax.Array
-    target_direction: jax.Array  # 目标速度方向（单位向量，用于随机方向运动）
     quad_params: ExtendedQuadrotorParams  # 添加quadrotor参数（扩展版，包含mass和gravity）
-    target_speed_max: float = 1.0  # 当前episode的目标最大速度（每次reset随机化）
     action_raw: jax.Array = field_jnp(jnp.zeros(4))
     filtered_acc: jax.Array = field_jnp([0.0, 0.0, 9.8])
     filtered_thrust: float = field_jnp(9.8)
-    # Flag to track if distance has ever exceeded reset_distance
-    has_exceeded_distance: bool = False
+    hover_origin: jax.Array = field_jnp([0.0, 0.0, -2.0])  # 悬停目标位置（原点）
 
 
 @jax.jit
@@ -83,8 +83,8 @@ def safe_norm(x, eps=1e-8):
     return jnp.sqrt(jnp.sum(x * x) + eps)
 
 
-class TrackEnvVer9(env_base.Env[TrackStateVer9]):
-    """Quadrotor tracking environment Ver9 - based on Ver8, now uses QuadrotorVer2 with PID control parameter randomization."""
+class HoverEnvVer2(env_base.Env[HoverStateVer2]):
+    """Quadrotor hovering environment Ver2 - hover at origin, based on HoverVer1 but with modified reward weight design."""
     
     def __init__(
         self,
@@ -95,17 +95,14 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         omega_std=0.1,
         drone_path=None,
         action_penalty_weight=0.1,
-        # Tracking specific parameters
-        target_height=2.0,  # m (height above ground, positive value)
-        target_init_distance_min=0.5,  # m (x轴上的初始距离最小值)
-        target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
-        target_speed_max=1.0,  # m/s (目标最大速度)
-        target_acceleration=0.5,  # m/s² (目标加速度，从0加速到最大速度)
-        reset_distance=100.0,  # m (重置距离阈值)
+        # Hovering specific parameters
+        hover_height=2.0,  # m (hover height above ground, positive value)
+        init_pos_range=0.5,  # m (initial position randomization range in x, y)
+        max_distance=10.0,  # m (maximum distance from origin before reset)
         max_speed=20.0,  # m/s
         # Parameter randomization (quadrotor)
         thrust_to_weight_min=1.2,  # 最小推重比
-        thrust_to_weight_max=3.0,  # 最大推重比
+        thrust_to_weight_max=5.0,  # 最大推重比
         disturbance_mag=0.0,  # [N] 常值扰动力大小（训练时>0，测试时=0）
     ):
         self.world_box = WorldBox(
@@ -116,8 +113,8 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         
         self.omega_std = omega_std
         
-        # quadrotor - 使用完整的四旋翼模型 Ver2（基于agilicious framework，支持PID参数随机化）
-        self.quadrotor = QuadrotorVer2(disturbance_mag=disturbance_mag)
+        # quadrotor - 使用完整的四旋翼模型（基于agilicious framework，不包含PID Kp参数随机化）
+        self.quadrotor = Quadrotor(disturbance_mag=disturbance_mag)
         
         # 获取四旋翼参数
         default_params = self.quadrotor.default_params()
@@ -143,13 +140,11 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         thrust_hover = self.quadrotor._mass * 9.81
         self.hovering_action = jnp.array([thrust_hover, 0.0, 0.0, 0.0])
         
-        # Tracking specific parameters
-        self.target_height = target_height
-        self.target_init_distance_min = target_init_distance_min
-        self.target_init_distance_max = target_init_distance_max
-        self.target_speed_max = target_speed_max
-        self.target_acceleration = target_acceleration
-        self.reset_distance = reset_distance
+        # Hovering specific parameters
+        self.hover_height = hover_height
+        self.init_pos_range = init_pos_range
+        self.max_distance = max_distance
+        self.hover_origin = jnp.array([0.0, 0.0, -hover_height])  # NED坐标系中的悬停目标位置
         
         # Parameter randomization
         self.thrust_to_weight_min = thrust_to_weight_min
@@ -157,8 +152,14 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         self.disturbance_mag = disturbance_mag
 
     def reset(
-        self, key: chex.PRNGKey, state: Optional[TrackStateVer9] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
-        """Reset environment with tracking-specific initialization.
+        self, key: chex.PRNGKey, state: Optional[HoverStateVer2] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
+        """Reset environment with hovering-specific initialization.
+        
+        Randomization:
+        - Position: Uniformly distributed within a ball of radius [0, 0.5]m around origin
+        - Velocity: Random direction, magnitude uniformly distributed in [0, 2] m/s
+        - Orientation: Roll and pitch in [-30°, 30°], yaw in [-π, π]
+        - Angular velocity: Initialized to 0
         
         Args:
             key: Random key for initialization
@@ -169,81 +170,69 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
             return state, self._get_obs(state)
         
         # 分割随机数key
-        keys = jax.random.split(key, 11)
-        key_target_x, key_target_y, key_target_z, key_target_dir, key_target_speed, key_roll, key_pitch, key_yaw, key_omega, key_quad, key_randomize = keys
+        keys = jax.random.split(key, 7)
+        key_pos, key_angles, key_vel, key_omega, key_randomize, key_vel_dir, key_vel_mag = keys
         
         # 获取quadrotor参数（如果没有提供则使用默认参数）
         if quad_params is None:
-            # # 暂时禁用参数随机化以加快训练速度
-            # # 使用默认参数
-            # quad_params = self.quadrotor.default_params()
-            
-            # 启用参数随机化（质量固定，推力、角速度、PID参数随机化）
+            # 启用参数随机化（质量固定，推力、角速度参数随机化，不包含PID Kp参数）
             base_params = self.quadrotor.default_params()
-            randomized_params = QuadrotorVer2.randomize_params(
+            randomized_params = Quadrotor.randomize_params(
                 base_params,
-                self.quadrotor._mass,  # QuadrotorVer2.randomize_params 需要 mass 参数
+                self.quadrotor._mass,  # Quadrotor.randomize_params 需要 mass 参数
                 key_randomize,
                 thrust_to_weight_min=self.thrust_to_weight_min,
                 thrust_to_weight_max=self.thrust_to_weight_max
             )
-            # 转换为扩展的参数类，添加mass和gravity，保留Kp参数（Ver2新增）
+            # 转换为扩展的参数类，添加mass和gravity（不包含Kp参数）
             quad_params = ExtendedQuadrotorParams(
                 thrust_max=randomized_params.thrust_max,
                 omega_max=randomized_params.omega_max,
                 motor_tau=randomized_params.motor_tau,
-                Kp=randomized_params.Kp,  # Ver2: PID比例增益参数
                 mass=self.quadrotor._mass,
                 gravity=9.81
             )
         
-        # ========== 目标物体初始化 ==========
-        # x正半轴上0.5～1.5m处
-        target_x = jax.random.uniform(
-            key_target_x, shape=(), 
-            minval=self.target_init_distance_min, 
-            maxval=self.target_init_distance_max
-        )
-        # y在(-0.2, 0.2)范围内随机
-        target_y = jax.random.uniform(
-            key_target_y, shape=(),
-            minval=-0.2,
-            maxval=0.2
-        )
-        # z在(-2.2, -1.8)范围内随机 (NED坐标系，高度在天上所以是负值)
-        target_z = jax.random.uniform(
-            key_target_z, shape=(),
-            minval=-2.2,
-            maxval=-1.8
-        )
-        target_pos = jnp.array([target_x, target_y, target_z])
-        
-        # 随机生成速度方向（单位向量，限制在水平面xy上）
-        # 生成一个随机角度（0到2π），然后在xy平面上生成单位向量
-        random_angle = jax.random.uniform(key_target_dir, shape=(), minval=0.0, maxval=2.0 * jnp.pi)
-        target_direction = jnp.array([jnp.cos(random_angle), jnp.sin(random_angle), 0.0])
-        
-        # 每次episode随机化目标最大速度（0到1m/s之间）
-        episode_target_speed_max = jax.random.uniform(
-            key_target_speed, shape=(),
-            minval=0.0,
-            maxval=self.target_speed_max
-        )
-        
-        # 初始速度为0，将加速到episode的目标最大速度（沿随机方向）
-        target_vel = jnp.array([0.0, 0.0, 0.0])
-        
         # ========== 无人机初始化 ==========
-        # 位置在原点，高度为2m（NED坐标系中z=-2）
-        p = jnp.array([0.0, 0.0, -self.target_height])
+        # 位置：距离原点0~0.5m范围内随机
+        # 生成随机单位向量（均匀分布在球面上）
+        pos_keys = jax.random.split(key_pos, 3)
+        # 使用球坐标系生成均匀分布
+        theta = jax.random.uniform(pos_keys[0], shape=(), minval=0.0, maxval=2.0 * jnp.pi)  # 方位角
+        phi = jnp.arccos(jax.random.uniform(pos_keys[1], shape=(), minval=-1.0, maxval=1.0))  # 极角
         
-        # 初始速度为零
-        v = jnp.zeros(3)
+        # 球坐标转笛卡尔坐标
+        random_direction = jnp.array([
+            jnp.sin(phi) * jnp.cos(theta),
+            jnp.sin(phi) * jnp.sin(theta),
+            jnp.cos(phi)
+        ])
         
-        # roll和pitch在±15°范围内随机，yaw随机
-        init_roll = jax.random.uniform(key_roll, shape=(), minval=-jnp.deg2rad(15.0), maxval=jnp.deg2rad(15.0))
-        init_pitch = jax.random.uniform(key_pitch, shape=(), minval=-jnp.deg2rad(15.0), maxval=jnp.deg2rad(15.0))
-        init_yaw = jax.random.uniform(key_yaw, shape=(), minval=-jnp.pi, maxval=jnp.pi)
+        # 距离在0~0.5m之间随机
+        random_distance = jax.random.uniform(pos_keys[2], shape=(), minval=0.0, maxval=0.5)
+        
+        # 位置 = 原点 + 随机距离 * 随机方向
+        p = self.hover_origin + random_distance * random_direction
+        
+        # 速度：随机方向，大小在0~0.5m/s范围内随机
+        vel_keys = jax.random.split(key_vel, 2)
+        vel_theta = jax.random.uniform(vel_keys[0], shape=(), minval=0.0, maxval=0.1 * jnp.pi)
+        vel_phi = jnp.arccos(jax.random.uniform(vel_keys[1], shape=(), minval=-1.0, maxval=1.0))
+        
+        vel_direction = jnp.array([
+            jnp.sin(vel_phi) * jnp.cos(vel_theta),
+            jnp.sin(vel_phi) * jnp.sin(vel_theta),
+            jnp.cos(vel_phi)
+        ])
+        vel_magnitude = jax.random.uniform(key_vel_mag, shape=(), minval=0.0, maxval=0.5)
+        v = vel_magnitude * vel_direction
+        
+        # 姿态角：yaw随机，roll和pitch限制在±30°范围内
+        angle_keys = jax.random.split(key_angles, 3)
+        max_tilt_angle = jnp.pi / 6  # ±30°
+        init_roll = jax.random.uniform(angle_keys[0], shape=(), minval=-max_tilt_angle, maxval=max_tilt_angle)
+        init_pitch = jax.random.uniform(angle_keys[1], shape=(), minval=-max_tilt_angle, maxval=max_tilt_angle)
+        init_yaw = jax.random.uniform(angle_keys[2], shape=(), minval=-jnp.pi, maxval=jnp.pi)
         
         # 将欧拉角转换为旋转矩阵
         c1, s1 = jnp.cos(init_roll), jnp.sin(init_roll)
@@ -264,16 +253,16 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
 
         R = R_z @ R_y @ R_x
         
-        # 随机角速度
-        omega = jax.random.normal(key_omega, (3,)) * self.omega_std * 0
+        # 角速度：初始化为0
+        omega = jnp.zeros(3)
 
         # Initialize quadrotor state
-        # QuadrotorVer2.create_state 使用位置参数 p, R, v，其他参数通过 kwargs 传递
-        quadrotor_state = self.quadrotor.create_state(p, R, v, omega=omega, dr_key=key_quad)
+        # Quadrotor.create_state 使用位置参数 p, R, v，其他参数通过 kwargs 传递
+        quadrotor_state = self.quadrotor.create_state(p, R, v, omega=omega)
         
         # Calculate hovering action based on current episode's quad_params
         # 悬停推力 = mass * gravity（使用当前episode的实际质量）
-        thrust_hover = self.quadrotor._mass * 9.81  # QuadrotorParams Ver2 不包含 mass 和 gravity，使用实例的 _mass
+        thrust_hover = self.quadrotor._mass * 9.81  # QuadrotorParams 不包含 mass 和 gravity，使用实例的 _mass
         hovering_action = jnp.array([thrust_hover, 0.0, 0.0, 0.0])
         
         # Initialize action history
@@ -282,33 +271,29 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         filtered_acc = jax.device_put(jnp.array([0.0, 0.0, 9.81]))  # NED坐标系，Down为正
         filtered_thrust = jax.device_put(jnp.array(thrust_hover))
 
-        state = TrackStateVer9(
+        state = HoverStateVer2(
             time=0.0,
             step_idx=0,
             quadrotor_state=quadrotor_state,
             last_actions=last_actions,
-            target_pos=target_pos,
-            target_vel=target_vel,
-            target_direction=target_direction,
             quad_params=quad_params,
-            target_speed_max=episode_target_speed_max,
             action_raw=action_raw,
             filtered_acc=filtered_acc,
             filtered_thrust=filtered_thrust,
-            has_exceeded_distance=False,
+            hover_origin=self.hover_origin,
         )
         
         return state, self._get_obs(state)
 
-    def _get_obs(self, state: TrackStateVer9) -> jax.Array:
+    def _get_obs(self, state: HoverStateVer2) -> jax.Array:
         """Get observation from state.
         
-        Ver9修改：继承Ver8，移除观测延迟，直接使用真实状态值，使用QuadrotorVer2
+        Ver2修改：基于HoverVer1，使用Quadrotor（不包含Kp参数）
         
         观测组成：
         1. 无人机机体系自身速度向量 (3)
         2. 无人机机体系重力方向 (3)
-        3. 无人机机体系目标物体坐标 (3)
+        3. 无人机机体系到原点的相对位置 (3)
         """
         # 直接使用真实状态（无延迟）
         quad_pos = state.quadrotor_state.p
@@ -323,23 +308,22 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         g_world = jnp.array([0.0, 0.0, 1.0])  # NED坐标系中重力方向 (Down为正)
         g_body = R_transpose @ g_world
         
-        # 3. 无人机机体系目标物体坐标（相对位置）
-        target_pos_world = state.target_pos
-        target_pos_relative_world = target_pos_world - quad_pos
-        target_pos_body = R_transpose @ target_pos_relative_world
+        # 3. 无人机机体系到原点的相对位置（原点 - 当前位置）
+        origin_pos_relative_world = state.hover_origin - quad_pos
+        origin_pos_body = R_transpose @ origin_pos_relative_world
 
         # Combine all observations
         components = [
             v_body,                                # 机体系速度 (3)
             g_body,                                # 机体系重力方向 (3)
-            target_pos_body,                       # 机体系目标位置 (3)
+            origin_pos_body,                       # 机体系到原点的相对位置 (3)
         ]  
         obs = jnp.concatenate(components)
         return obs
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _step(
-        self, state: TrackStateVer9, action: jax.Array, key: chex.PRNGKey
+        self, state: HoverStateVer2, action: jax.Array, key: chex.PRNGKey
     ) -> EnvTransition:
         # 保存原始action (tanh输出为[-1,1]范围)
         action_raw = action
@@ -377,12 +361,12 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         dt_1 = self.delay % self.dt
         action_1 = last_actions[0]
         f_1, omega_1 = action_1[0], action_1[1:]
-        # 直接传递ExtendedQuadrotorParams（包含mass、gravity、external_force、Kp）
-        # QuadrotorVer2的step方法现在支持ExtendedQuadrotorParams（包含Kp参数）
+        # 直接传递ExtendedQuadrotorParams（包含mass、gravity、external_force，不包含Kp）
+        # Quadrotor的step方法支持ExtendedQuadrotorParams（不包含Kp参数）
         quadrotor_state = self.quadrotor.step(
             state.quadrotor_state, f_1, omega_1, dt_1, 
             drag_params=None,  # 使用默认drag_params
-            quad_params=state.quad_params  # 使用ExtendedQuadrotorParams（Ver2包含Kp）
+            quad_params=state.quad_params  # 使用ExtendedQuadrotorParams（不包含Kp）
         )
 
         if self.delay > 0:
@@ -393,7 +377,7 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
             quadrotor_state = self.quadrotor.step(
                 quadrotor_state, f_2, omega_2, dt_2,
                 drag_params=None,  # 使用默认drag_params
-                quad_params=state.quad_params  # 使用ExtendedQuadrotorParams（Ver2包含Kp）
+                quad_params=state.quad_params  # 使用ExtendedQuadrotorParams（不包含Kp）
             )
 
         # 更新滤波值
@@ -412,25 +396,6 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         filtered_acc = first_order_filter(specific_force, state.filtered_acc, alpha_acc)
         filtered_thrust = first_order_filter(action_1[0], state.filtered_thrust, alpha_thrust)
 
-        # 目标物体加速运动（从0加速到当前episode的最大速度，沿随机方向）
-        current_speed_vec = state.target_vel
-        current_speed = safe_norm(current_speed_vec, eps=1e-8)
-        episode_target_speed_max = state.target_speed_max  # 使用当前episode的目标最大速度
-        target_acc = self.target_acceleration
-        
-        # 如果当前速度小于最大速度，则加速
-        new_speed = jnp.minimum(
-            current_speed + target_acc * self.dt,
-            episode_target_speed_max
-        )
-        # 速度向量 = 速度大小 * 方向单位向量
-        target_vel = new_speed * state.target_direction
-        target_pos = state.target_pos + target_vel * self.dt
-        
-        # 检查距离是否超过10m，更新标志位
-        distance_to_target = safe_norm(quadrotor_state.p - target_pos, eps=1e-8)
-        has_exceeded_distance = state.has_exceeded_distance | (distance_to_target > self.reset_distance)
-        
         next_state = dataclasses.replace(
             state,
             time=state.time + self.dt,
@@ -438,22 +403,18 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
             quadrotor_state=quadrotor_state,
             last_actions=last_actions,
             quad_params=state.quad_params,  # 保持quad_params不变
-            target_speed_max=state.target_speed_max,  # 保持target_speed_max不变
             action_raw=action_raw,
             filtered_acc=filtered_acc,
             filtered_thrust=filtered_thrust,
-            target_pos=target_pos,
-            target_vel=target_vel,
-            target_direction=state.target_direction,  # 保持方向不变
-            has_exceeded_distance=has_exceeded_distance,
+            hover_origin=state.hover_origin,  # 保持悬停原点不变
         )
 
         obs = self._get_obs(next_state)
         reward = self._compute_reward(state, next_state)
         
-        # 检查是否需要重置（距离大于10m）
-        distance_to_target = safe_norm(next_state.quadrotor_state.p - next_state.target_pos, eps=1e-8)
-        terminated = distance_to_target > self.reset_distance
+        # 检查是否需要重置（距离原点大于max_distance）
+        distance_to_origin = safe_norm(next_state.quadrotor_state.p - next_state.hover_origin, eps=1e-8)
+        terminated = distance_to_origin > self.max_distance
         
         truncated = jnp.greater_equal(
             next_state.step_idx, self.max_steps_in_episode
@@ -464,10 +425,8 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
             "quad_v": next_state.quadrotor_state.v,
             "quad_acc": next_state.quadrotor_state.acc,
             "quad_R": next_state.quadrotor_state.R,
-            "target_p": next_state.target_pos,
-            "target_v": next_state.target_vel,
             "action": next_state.last_actions[-1],
-            "distance_to_target": distance_to_target,
+            "distance_to_origin": distance_to_origin,
         }
 
         return EnvTransition(
@@ -475,94 +434,64 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         )
 
     def _compute_reward(
-        self, last_state: TrackStateVer9, next_state: TrackStateVer9
+        self, last_state: HoverStateVer2, next_state: HoverStateVer2
     ) -> jax.Array:
-        """计算奖励 - 基于 agile_lossVer7 算法
+        """计算奖励 - 悬停任务奖励函数 (Ver2: 相对于Ver1修改了reward权重设计)
         奖励设计：
-        1. 方向损失：使用余弦相似度计算完整3D方向
-        2. 距离损失：水平距离与目标距离的绝对差值
-        3. 高度损失：无人机高度与目标高度的绝对差值
-        4. 速度损失：相对速度模长
-        5. 姿态损失：基于机体z轴方向的惩罚
-        6. 动作损失：当前动作与上一动作的L2范数
-        7. 角速度损失：惩罚旋转运动（防止roll持续旋转）
+        1. 位置损失：到原点的水平距离
+        2. 高度损失：与目标高度的偏差
+        3. 速度损失：速度模长（应该接近0）
+        4. 姿态损失：基于机体z轴方向的惩罚
+        5. 动作损失：当前动作与上一动作的L2范数
+        6. 角速度损失：惩罚旋转运动
+        7. 推力超限损失：动作推力与悬停推力的L2范数
+        
+        Ver2相对于Ver1的修改：调整了各项损失的权重设计，以优化训练效果。
         """
         # 获取状态信息
         quad_pos = next_state.quadrotor_state.p
         quad_vel = next_state.quadrotor_state.v
         quad_R = next_state.quadrotor_state.R
-        quad_omega = next_state.quadrotor_state.omega  # 获取角速度用于惩罚旋转
-        target_pos = next_state.target_pos
-        target_vel = next_state.target_vel
+        quad_omega = next_state.quadrotor_state.omega
+        hover_origin = next_state.hover_origin
         
-        # 计算相对位置和速度
-        p_rel = target_pos - quad_pos
-        v_rel = target_vel - quad_vel
-        
-        # 1. 方向损失 (direction) - 使用余弦相似度计算完整3D方向
-        # 将相对位置向量转换到机体坐标系
-        R_transpose = jnp.transpose(quad_R)
-        direction_vector_body = R_transpose @ p_rel
-        direction_vector_body_unit = direction_vector_body / (safe_norm(direction_vector_body, eps=1e-6))
-        
-        init_vec = jnp.array([1.0, 0.0, 0.0])  # 机体前向方向（完整3D）
-        cos_similarity = jnp.dot(init_vec, direction_vector_body_unit)
-        cos_similarity = jnp.clip(cos_similarity, -1.0, 1.0)
-        
-        # 零惩罚范围：方向 < 15° 时损失为0
-        # cos(15°) ≈ 0.966
-        cos_threshold = jnp.cos(jnp.deg2rad(15.0))
-        direction_loss_base = jnp.exp(1 - cos_similarity) - 1
-        # 计算阈值处的损失值，用于保持连续性
-        threshold_loss = jnp.exp(1 - cos_threshold) - 1
-        # 在阈值内损失为0，超出后从阈值处开始线性增加
-        direction_loss = jnp.where(
-            cos_similarity >= cos_threshold,
+        # 1. 位置损失 (position) - 到原点的水平距离
+        p_rel = quad_pos - hover_origin
+        horizontal_distance = safe_norm(p_rel[:2], eps=1e-8)
+        # 零惩罚范围：位置 < 10cm 时损失为0
+        position_threshold = 0.1  # 10cm
+        position_loss = jnp.where(
+            horizontal_distance < position_threshold,
             0.0,
-            direction_loss_base - threshold_loss  # 减去阈值处的损失，使在阈值处连续
+            horizontal_distance - position_threshold  # 超出后从0开始线性增加
         )
         
-        
-        # 2. 距离损失 (distance) - 水平距离与目标距离的绝对差值
-        norm_hor_dis = safe_norm(p_rel[:2], eps=1e-8)
-        target_distance = 1.0  # 目标距离1米
-        distance_error = jnp.abs(norm_hor_dis - target_distance)
-        # 零惩罚范围：位置 < 30cm 时损失为0
-        position_threshold = 0.3  # 30cm
-        distance_loss = jnp.where(
-            distance_error < position_threshold,
-            0.0,
-            distance_error - position_threshold  # 超出后从0开始线性增加
-        )
-        
-        # 3. 高度损失 (h) - 无人机高度与目标高度的绝对差值
-        height_error = jnp.abs(quad_pos[2] - target_pos[2])
-        # 零惩罚范围：位置 < 30cm 时损失为0
+        # 2. 高度损失 (height) - 与目标高度的偏差
+        height_error = jnp.abs(quad_pos[2] - hover_origin[2])
+        # 零惩罚范围：高度 < 10cm 时损失为0
         height_loss = jnp.where(
             height_error < position_threshold,
             0.0,
             height_error - position_threshold  # 超出后从0开始线性增加
         )
         
-        # 4. 速度损失 (vel) - 相对速度模长
-        velocity_error = safe_norm(v_rel, eps=1e-8)
-        # 零惩罚范围：速度 < 0.3m/s 时损失为0
-        velocity_threshold = 0.3  # 0.3m/s
+        # 3. 速度损失 (velocity) - 速度模长（悬停时应该接近0）
+        velocity_error = safe_norm(quad_vel, eps=1e-8)
+        # 零惩罚范围：速度 < 0.1m/s 时损失为0
+        velocity_threshold = 0.1  # 0.1m/s
         velocity_loss = jnp.where(
             velocity_error < velocity_threshold,
             0.0,
             velocity_error - velocity_threshold  # 超出后从0开始线性增加
         )
         
-        # 5. 姿态损失 (ori) - 基于机体z轴方向的惩罚，改为指数增长
+        # 4. 姿态损失 (orientation) - 基于机体z轴方向的惩罚
         body_z_world = quad_R @ jnp.array([0.0, 0.0, -1.0])  # 机体z轴在世界系中的方向
         # 理想情况下，机体z轴应该指向上方（-z方向），body_z_world应该接近[0, 0, -1]
-        # 惩罚当body_z_world[2]偏离-1的情况（即偏离垂直）
-        # 使用指数增长：exp(偏离度) - 1
         ori_deviation = (body_z_world[2] + 1.0) ** 2  # 偏离度（0到4之间）
         ori_loss = 10 * (jnp.exp(ori_deviation) - 1.0)  # 指数增长
         
-        # 6. 动作损失 (aux) - 当前动作与上一动作的L2范数，改为指数增长
+        # 5. 动作损失 (action) - 当前动作与上一动作的L2范数
         action_current = next_state.action_raw
         action_last = jnp.where(
             last_state.step_idx == 0,
@@ -573,26 +502,39 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
         action_error = safe_norm(action_change, eps=1e-8)
         action_loss = jnp.exp(action_error) - 1.0  # 指数增长
         
-        # 7. 角速度损失 - 防止持续旋转，改为指数增长
+        # 6. 角速度损失 - 防止持续旋转
         omega_error = safe_norm(quad_omega, eps=1e-8)
         omega_loss = jnp.exp(omega_error) - 1.0  # 指数增长
         
-        # 总损失 - 根据新的损失函数特性调整权重
-        # 权重调整说明：
-        # - 方向损失：有零惩罚范围(<15°)，超出后指数增长，权重降低到40
-        # - 位置损失（距离和高度）：有零惩罚范围(<30cm)，超出后线性增长，保持较高权重80
-        # - 速度损失：有零惩罚范围(<0.3m/s)，超出后线性增长，权重提高到3
-        # - 姿态损失：改为指数增长，权重降低到0.5（指数增长本身会快速增加）
-        # - 动作损失：改为指数增长，权重降低到0.3
-        # - 角速度损失：改为指数增长，权重降低到0.3
+        # 7. 推力超限损失 - 约束推力，动作推力与悬停推力的L2范数
+        # 使用当前动作（归一化后的值），需要去归一化
+        thrust_normalized = action_current[0]
+        # 去归一化推力：[-1, 1] -> [thrust_min*4, thrust_max*4]
+        actual_thrust_max = next_state.quad_params.thrust_max
+        action_thrust = 0.5 * (thrust_normalized + 1.0) * (actual_thrust_max * 4 - self.thrust_min * 4) + self.thrust_min * 4
+        # 计算悬停推力：mass * gravity
+        thrust_hover = next_state.quad_params.mass * next_state.quad_params.gravity
+        # 计算推力偏差的L2范数（对于标量，L2范数就是绝对差值）
+        thrust_error = action_thrust - thrust_hover
+        thrust_loss = safe_norm(jnp.array([thrust_error]), eps=1e-8)
+        
+        # 总损失 - 悬停任务权重调整 (Ver2: 相对于Ver1修改了权重设计)
+        # - 位置损失：最高权重，确保在原点附近悬停
+        # - 高度损失：高权重，保持目标高度
+        # - 速度损失：高权重，保持静止
+        # - 姿态损失：中等权重，保持水平姿态
+        # - 动作损失：低权重，平滑控制
+        # - 角速度损失：低权重，减少旋转
+        # - 推力超限损失：中等权重，约束推力接近悬停推力
+        # Ver2相对于Ver1：调整了各项损失的权重比例，以优化训练效果
         total_loss = (
-            0.5 * ori_loss +           # 姿态损失：指数增长，权重降低
-            80 * distance_loss +        # 距离损失：零惩罚范围后线性增长，保持较高权重
-            3 * velocity_loss +         # 速度损失：零惩罚范围后线性增长，权重提高
-            40 * direction_loss +       # 方向损失：零惩罚范围后指数增长，权重稍微降低
-            80 * height_loss +          # 高度损失：零惩罚范围后线性增长，保持较高权重
-            10 * action_loss +         # 动作损失：指数增长，权重降低
-            10 * omega_loss             # 角速度损失：指数增长，权重降低
+            10 * position_loss +      # 位置损失：最高权重
+            100 * height_loss +        # 高度损失：最高权重
+            5 * velocity_loss +       # 速度损失：高权重
+            10 * ori_loss +           # 姿态损失：中等权重
+            80 * action_loss +          # 动作损失：低权重
+            80 * omega_loss +           # 角速度损失：低权重
+            50 * thrust_loss            # 推力超限损失：中等权重
         )
         
         # 转换为奖励（负的损失）
@@ -625,24 +567,24 @@ class TrackEnvVer9(env_base.Env[TrackStateVer9]):
     def observation_space(self) -> spaces.Box:
         """Get observation space.
         
-        Ver9修改：继承Ver8，移除观测延迟，直接使用真实状态值，使用QuadrotorVer2
+        Ver2修改：基于HoverVer1，使用Quadrotor（不包含Kp参数）
         
         观测组成：
         1. 机体系速度 (3)
         2. 机体系重力方向 (3)
-        3. 机体系目标位置 (3)
+        3. 机体系到原点的相对位置 (3)
         """
         obs_dim = 3 + 3 + 3  # 总维度9
         
         low = jnp.concatenate([
             self.v_min,                       # 机体系速度最小值
             -jnp.ones(3),                     # 重力方向最小值
-            jnp.array([-100.0, -100.0, -100.0]),  # 目标位置最小值（相对）
+            jnp.array([-100.0, -100.0, -100.0]),  # 到原点相对位置最小值
         ])
         high = jnp.concatenate([
             self.v_max,                       # 机体系速度最大值
             jnp.ones(3),                      # 重力方向最大值
-            jnp.array([100.0, 100.0, 100.0]), # 目标位置最大值（相对）
+            jnp.array([100.0, 100.0, 100.0]), # 到原点相对位置最大值
         ])
         return spaces.Box(low=low, high=high, shape=(obs_dim,), dtype=jnp.float32)
 
@@ -652,14 +594,14 @@ if __name__ == "__main__":
     
     key_gen = key_generator(0)
 
-    env = TrackEnvVer9()
+    env = HoverEnvVer2()
 
     state, obs = env.reset(next(key_gen))
     print(f"Initial observation shape: {obs.shape}")
     print(f"Initial observation: {obs}")
     print(f"Initial quad position: {state.quadrotor_state.p}")
-    print(f"Initial target position: {state.target_pos}")
-    print(f"Initial distance: {jnp.linalg.norm(state.quadrotor_state.p - state.target_pos)}")
+    print(f"Hover origin: {state.hover_origin}")
+    print(f"Initial distance to origin: {jnp.linalg.norm(state.quadrotor_state.p - state.hover_origin)}")
     
     random_action = env.action_space.sample(next(key_gen))
     transition = env.step(state, random_action, next(key_gen))
@@ -667,5 +609,6 @@ if __name__ == "__main__":
     print(f"\nAfter step:")
     print(f"Observation: {obs}")
     print(f"Reward: {reward}")
-    print(f"Distance to target: {info['distance_to_target']}")
+    print(f"Distance to origin: {info['distance_to_origin']}")
     print(f"Terminated: {terminated}")
+

@@ -323,11 +323,11 @@ def save_model_info(output_dir, input_dim, action_dim, buffer_size, action_repea
 def main():
     # ==================== 配置 ====================
     # 输入文件路径
-    checkpoint_path = 'aquila/param/hoverVer1_policy.pkl'
+    checkpoint_path = 'aquila/param/hoverVer2_policy.pkl'
     
     # 输出文件路径
     output_dir = 'aquila/param/tflite'
-    tflite_path = os.path.join(output_dir, 'hoverVer1_policy_stable.tflite')
+    tflite_path = os.path.join(output_dir, 'hoverVer2_policy.tflite')
     
     # 是否启用优化（警告：启用优化可能导致严重的精度损失！）
     optimize = False  # 建议保持 False 以确保模型精度

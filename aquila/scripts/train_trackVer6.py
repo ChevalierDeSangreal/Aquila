@@ -79,6 +79,7 @@ def main():
         # Parameter randomization (quadrotor)
         thrust_to_weight_min=1.5,  # 最小推重比
         thrust_to_weight_max=3.0,  # 最大推重比
+        disturbance_mag=2.0,  # 训练时开启常值随机扰动（2N），提高鲁棒性
     )
     
     # Normalize obs to [-1,1] and actions to [-1,1]

@@ -106,6 +106,7 @@ class QuadrotorVer2:
             thrust_max=2.5,  # [N] per motor
             rotors_config="cross",
             dt_low_level=0.001,
+            disturbance_mag=0.0,  # [N] 常值扰动力的大小（训练时可设置>0，测试时设置为0）
     ):
         assert (
                 rotors_config == "cross"
@@ -130,6 +131,7 @@ class QuadrotorVer2:
         self._rotors_config = rotors_config
         self._dt_low_level = dt_low_level
         self._gravity = jnp.array([0, 0, 9.81]) # 向下为正
+        self._disturbance_mag = disturbance_mag  # 保存扰动力大小参数
 
         # drag parameters
         self._drag_params = BodyDragParams(
@@ -139,6 +141,7 @@ class QuadrotorVer2:
             frontarea_y=1.0e-3,
             frontarea_z=1.0e-2,
             air_density=1.2,
+            disturbance_mag=disturbance_mag,  # 使用参数设置扰动力大小
         )
 
 

@@ -14,6 +14,52 @@ import time
 import re
 
 
+def load_input_from_debug_output():
+    """从调试输出中构建输入数组（基于Step 10的Buffer数据）"""
+    # 根据终端输出构建输入
+    # Buffer[0-7]: Action: [-0.497376, 0., 0., 0.], Obs: [0., 0., 0., 0., 0., 0., 0., 0., 0.]
+    # Buffer[8]: Action: [-0.486797, -0.044479, -0.026532, 0.035554], Obs: [0., 0., 0., 0., 0., 1., 0., 0., 0.]
+    # Buffer[9]: Action: [0., 0., 0., 0.], Obs: [-0.007041, -0.006874, 0.000043, 0.001008, -0.001407, 0.999999, 0.00007, 0.000068, -0.000002]
+    
+    buffer_size = 10
+    action_dim = 4
+    obs_dim = 9
+    
+    # 构建缓冲区
+    input_array = []
+    
+    # Buffer[0-7]: 相同的action和obs
+    action_0_7 = np.array([-0.497376, 0., 0., 0.], dtype=np.float32)
+    obs_0_7 = np.array([0., 0., 0., 0., 0., 0., 0., 0., 0.], dtype=np.float32)
+    for i in range(8):
+        input_array.extend(action_0_7)
+        input_array.extend(obs_0_7)
+    
+    # Buffer[8]
+    action_8 = np.array([-0.486797, -0.044479, -0.026532, 0.035554], dtype=np.float32)
+    obs_8 = np.array([0., 0., 0., 0., 0., 1., 0., 0., 0.], dtype=np.float32)
+    input_array.extend(action_8)
+    input_array.extend(obs_8)
+    
+    # Buffer[9]
+    action_9 = np.array([0., 0., 0., 0.], dtype=np.float32)
+    obs_9 = np.array([-0.007041, -0.006874, 0.000043, 0.001008, -0.001407, 0.999999, 0.00007, 0.000068, -0.000002], dtype=np.float32)
+    input_array.extend(action_9)
+    input_array.extend(obs_9)
+    
+    input_array = np.array(input_array, dtype=np.float32)
+    
+    expected_output = np.array([-0.482071, 0.539039, -0.74387, 0.030808], dtype=np.float32)
+    
+    print(f"✅ Built input array from debug output (Step 10)")
+    print(f"   Input dimension: {len(input_array)}")
+    print(f"   Expected output: {expected_output}")
+    print(f"   First 5 values: {input_array[:5]}")
+    print(f"   Last 5 values: {input_array[-5:]}")
+    
+    return input_array, expected_output
+
+
 def load_input_from_tmplog(tmplog_path):
     """从tmplog.txt文件中加载输入数据"""
     if not os.path.exists(tmplog_path):
@@ -55,7 +101,7 @@ def load_input_from_tmplog(tmplog_path):
     return input_array
 
 
-def test_tflite_model(model_path, num_tests=10, fixed_input=None):
+def test_tflite_model(model_path, num_tests=10, fixed_input=None, expected_output=None):
     """测试TFLite模型"""
     
     print("=" * 60)
@@ -108,7 +154,7 @@ def test_tflite_model(model_path, num_tests=10, fixed_input=None):
                 # 填充零
                 fixed_input = np.pad(fixed_input, (0, input_dim - len(fixed_input)), mode='constant')
         test_input_base = fixed_input.reshape(1, input_dim)
-        print(f"✅ Using fixed input from tmplog (dimension: {input_dim})")
+        print(f"✅ Using fixed input (dimension: {input_dim})")
     else:
         test_input_base = None
         print(f"⚠️  Using random input (dimension: {input_dim})")
@@ -146,6 +192,12 @@ def test_tflite_model(model_path, num_tests=10, fixed_input=None):
             print(f"\n  Test 1:")
             print(f"    Input (first 5 elements): {test_input[0][:5]}")
             print(f"    Output: {output[0]}")
+            if expected_output is not None:
+                diff = np.abs(output[0] - expected_output)
+                print(f"    Expected output: {expected_output}")
+                print(f"    Difference: {diff}")
+                print(f"    Max difference: {np.max(diff):.8f}")
+                print(f"    Mean difference: {np.mean(diff):.8f}")
             print(f"    Inference time: {inference_time:.4f} ms")
     
     # 统计信息
@@ -168,6 +220,24 @@ def test_tflite_model(model_path, num_tests=10, fixed_input=None):
         print("  ✅ Output values are within expected range [-1, 1]")
     else:
         print("  ⚠️  Warning: Some output values are outside expected range [-1, 1]")
+    
+    # 如果有期望输出，比较结果
+    if expected_output is not None:
+        print(f"\nExpected Output Comparison:")
+        first_output = outputs[0][0]
+        diff = np.abs(first_output - expected_output)
+        print(f"  Expected: {expected_output}")
+        print(f"  Actual:   {first_output}")
+        print(f"  Max difference: {np.max(diff):.8f}")
+        print(f"  Mean difference: {np.mean(diff):.8f}")
+        if np.max(diff) < 1e-5:
+            print("  ✅ Output matches expected (difference < 1e-5)")
+        elif np.max(diff) < 1e-4:
+            print("  ✅ Output very close to expected (difference < 1e-4)")
+        elif np.max(diff) < 1e-3:
+            print("  ⚠️  Output close to expected (difference < 1e-3)")
+        else:
+            print("  ❌ Output differs significantly from expected!")
     
     print("\n" + "=" * 60)
     print("✅ All tests passed!")
@@ -280,8 +350,8 @@ def compare_with_original(tflite_path, pkl_path, fixed_input=None):
 
 def main():
     # 默认路径
-    tflite_path = 'aquila/param/tflite/trackVer8_policy_stabler.tflite'
-    pkl_path = 'aquila/param/trackVer8_policy_stabler.pkl'
+    tflite_path = 'aquila/param/tflite/hoverVer1_policy_stable.tflite'
+    pkl_path = 'aquila/param/hoverVer1_policy_stable.pkl'
     tmplog_path = 'tmplog.txt'
     
     # 命令行参数
@@ -292,17 +362,31 @@ def main():
     if len(sys.argv) > 3:
         tmplog_path = sys.argv[3]
     
-    # 加载固定输入
+    # 优先使用调试输出构建的输入
     print("=" * 60)
     print("Loading test input data")
     print("=" * 60)
-    fixed_input = load_input_from_tmplog(tmplog_path)
-    if fixed_input is None:
-        print("⚠️  Warning: Using random inputs instead")
+    
+    # 从调试输出构建输入（Step 10的数据）
+    fixed_input, expected_output = load_input_from_debug_output()
+    
+    # 如果tmplog文件存在，也可以尝试加载（但优先使用调试输出）
+    if os.path.exists(tmplog_path):
+        tmplog_input = load_input_from_tmplog(tmplog_path)
+        if tmplog_input is not None and len(tmplog_input) == len(fixed_input):
+            print(f"\n⚠️  tmplog file found, but using debug output input instead")
+    else:
+        print(f"\n⚠️  tmplog file not found, using debug output input")
+    
     print()
     
     # 测试TFLite模型
-    success = test_tflite_model(tflite_path, num_tests=100, fixed_input=fixed_input)
+    success = test_tflite_model(
+        tflite_path, 
+        num_tests=100, 
+        fixed_input=fixed_input,
+        expected_output=expected_output
+    )
     
     if not success:
         sys.exit(1)

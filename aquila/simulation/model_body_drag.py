@@ -80,7 +80,8 @@ def compute_drag_force(state, key, params: BodyDragParams) -> jnp.ndarray:
     def sample_random():
         rnd = jax.random.uniform(key_disturb, shape=(3,), minval=-1.0, maxval=1.0)
         nrm = jnp.maximum(jnp.linalg.norm(rnd), 1.0)
-        return 2.0*rnd / nrm  # 模长≤1（世界坐标）
+        # 修复：乘以 disturbance_mag，这样当其为0时扰动真正为0
+        return (rnd / nrm) * jnp.asarray(params.disturbance_mag, dtype=jnp.float32)
 
     disturb_world = jax.lax.cond(
         params.use_fixed_disturbances,

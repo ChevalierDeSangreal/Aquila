@@ -21,10 +21,10 @@ import pickle
 from torch.utils.tensorboard import SummaryWriter
 
 # Add parent directory to path for imports
-# aquila/scripts/train_hoverVer0.py -> ../../ -> Aquila project root
+# aquila/scripts/train_hoverVer2.py -> ../../ -> Aquila project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.hoverVer0 import HoverEnvVer0  # 使用HoverEnvVer0（基于TrackVer9，悬停任务，使用QuadrotorVer2支持PID参数随机化）
+from aquila.envs.hoverVer2 import HoverEnvVer2  # 使用HoverEnvVer2（基于HoverVer0，悬停任务，使用Quadrotor不支持PID Kp参数随机化）
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
 from aquila.algos import bptt
@@ -62,8 +62,8 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Environment Setup ====================
-    # Create env - 使用HoverEnvVer0环境（基于TrackVer9，悬停任务，使用QuadrotorVer2支持PID参数随机化）
-    env = HoverEnvVer0(
+    # Create env - 使用HoverEnvVer2环境（基于HoverVer0，悬停任务，使用Quadrotor不支持PID Kp参数随机化）
+    env = HoverEnvVer2(
         max_steps_in_episode=1000,  # 悬停任务的最大步数
         dt=0.01,  # 使用完整四旋翼的默认时间步长
         delay=0.03,  # 可选执行延迟
@@ -86,7 +86,7 @@ def main():
     
     # ==================== Model Setup ====================
     # 输入维度变为缓冲区大小 * (观测维度 + 动作维度)
-    buffer_size = 10  # 动作-状态缓冲区大小
+    buffer_size = 50  # 动作-状态缓冲区大小
     action_dim = env.action_space.shape[0]
     obs_dim = env.observation_space.shape[0]
     input_dim = buffer_size * (obs_dim + action_dim)  # 输入维度为缓冲区大小乘以(观测维度+动作维度)
@@ -104,7 +104,7 @@ def main():
     num_envs = 512 # 并行环境数（单卡）
     
     # 动作重复参数
-    action_repeat = 10  # 每10个step才获取一次新动作
+    action_repeat = 2  # 每2个step才获取一次新动作（每秒50次动作，每次持续0.02秒）
     
     # Optimizer - 使用余弦衰减学习率
     initial_learning_rate = 5e-3
@@ -136,7 +136,7 @@ def main():
         print("✅ 使用初始网络参数开始训练")
     else:
         # 使用加载的参数
-        policy_file = 'aquila/param/hoverVer0_policy.pkl'  # 使用hoverVer0的模型文件
+        policy_file = 'aquila/param/hoverVer2_policy.pkl'  # 使用hoverVer2的模型文件
         loaded_params, env_config = load_trained_policy(policy_file)
         train_state = TrainState.create(
             apply_fn=policy.apply,
@@ -147,7 +147,7 @@ def main():
     
     # ==================== TensorBoard Setup ====================
     # 创建tensorboard日志目录
-    log_dir = f'runs/hoverVer0_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用hoverVer0的日志目录
+    log_dir = f'runs/hoverVer2_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用hoverVer2的日志目录
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard logs will be saved to: {log_dir}")
     print(f"Run 'tensorboard --logdir=runs' to view training progress")
@@ -160,14 +160,14 @@ def main():
     training_log = []
     
     print(f"\n{'='*60}")
-    print(f"开始训练悬停任务 (HoverVer0 - 基于TrackVer9，使用QuadrotorVer2支持PID参数随机化)...")
+    print(f"开始训练悬停任务 (HoverVer2 - 基于HoverVer0，使用Quadrotor不支持PID Kp参数随机化)...")
     print(f"Total environments: {num_envs}")
     print(f"Number of epochs: {num_epochs}")
     print(f"Steps per epoch: {env.max_steps_in_episode}")
     print(f"Action repeat: {action_repeat} steps")
     print(f"Action-obs buffer size: {buffer_size}")
     print(f"Input dimension: {input_dim}")
-    print(f"Quadrotor model: Full (QuadrotorVer2 - based on agilicious framework, with PID parameter randomization)")
+    print(f"Quadrotor model: Full (Quadrotor - based on agilicious framework, without PID Kp parameter randomization)")
     print(f"{'='*60}\n")
     
     # 使用单卡训练函数
@@ -232,7 +232,7 @@ def main():
     
     # ==================== Print Summary ====================
     print(f"\n{'='*60}")
-    print(f"悬停任务训练完成！(HoverVer0 - 基于TrackVer9，使用QuadrotorVer2支持PID参数随机化)")
+    print(f"悬停任务训练完成！(HoverVer2 - 基于HoverVer0，使用Quadrotor不支持PID Kp参数随机化)")
     print(f"{'='*60}")
     print(f"Training time: {training_time:.2f} seconds ({training_time/60:.2f} minutes)")
     print(f"Final Loss: {final_loss:.6f}")
@@ -242,7 +242,7 @@ def main():
     print(f"Action-obs buffer size: {buffer_size}")
     print(f"Input dimension: {input_dim}")
     print(f"Effective actions per epoch: {env.max_steps_in_episode / action_repeat:.1f}")
-    print(f"Quadrotor model: Full (QuadrotorVer2 - based on agilicious framework, with PID parameter randomization)")
+    print(f"Quadrotor model: Full (Quadrotor - based on agilicious framework, without PID Kp parameter randomization)")
     
     
     
@@ -262,7 +262,7 @@ def main():
             'dt': env.dt,
             'delay': env.delay,
             'action_penalty_weight': env.action_penalty_weight,
-            # HoverVer0 基于TrackVer9，使用QuadrotorVer2：悬停任务，初始位置在0~0.5m球体内随机，姿态和速度完全随机，PID参数随机化
+            # HoverVer2 基于HoverVer0，使用Quadrotor：悬停任务，初始位置在0~0.5m球体内随机，姿态和速度完全随机，不支持PID Kp参数随机化
             'hover_height': env.hover_height,
             'init_pos_range': env.init_pos_range,
             'max_distance': env.max_distance,
@@ -274,14 +274,14 @@ def main():
     os.makedirs('aquila/param', exist_ok=True)
     
     # 保存为pickle文件
-    checkpoint_path = 'aquila/param/hoverVer0_policy.pkl'  # 使用hoverVer0的文件名
+    checkpoint_path = 'aquila/param/hoverVer2_policy.pkl'  # 使用hoverVer2的文件名
     with open(checkpoint_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"\n✅ Trained hovering policy saved as: {checkpoint_path}")
     
     # 额外保存一个带时间戳的备份
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = f'aquila/param/hoverVer0_policy_{timestamp}.pkl'  # 使用hoverVer0的文件名
+    backup_path = f'aquila/param/hoverVer2_policy_{timestamp}.pkl'  # 使用hoverVer2的文件名
     with open(backup_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"✅ Backup saved as: {backup_path}")
@@ -294,3 +294,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
