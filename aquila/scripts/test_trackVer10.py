@@ -17,7 +17,7 @@ import pickle
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.target_trackVer8 import TrackEnvVer8, ExtendedQuadrotorParams
+from aquila.envs.target_trackVer10 import TrackEnvVer10, ExtendedQuadrotorParams
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
 
@@ -102,13 +102,13 @@ def test_policy():
     """测试训练好的策略"""
     
     # ==================== Load Policy ====================
-    policy_file = 'aquila/param/trackVer8_policy_stabler_zerobuffer.pkl'
-    # policy_file = 'aquila/param/trackVer10_policy.pkl'
+    # policy_file = 'aquila/param/trackVer8_policy_stabler.pkl'
+    policy_file = 'aquila/param/trackVer10_policy.pkl'
     params, env_config, action_repeat, buffer_size = load_trained_policy(policy_file)
     
     # ==================== Environment Setup ====================
     # 创建环境（与训练时相同的配置）
-    env = TrackEnvVer8(
+    env = TrackEnvVer10(
         max_steps_in_episode=1000,
         dt=0.01,
         delay=0.03,
@@ -137,7 +137,7 @@ def test_policy():
     policy = MLP([input_dim, 128, 128, action_dim], initial_scale=0.2)
     
     print(f"\n{'='*60}")
-    print(f"Testing TrackVer8 Policy")
+    print(f"Testing TrackVer10 Policy")
     print(f"{'='*60}")
     print(f"Observation dimension: {obs_dim}")
     print(f"Action dimension: {action_dim}")
@@ -189,9 +189,9 @@ def test_policy():
     num_last_actions = env.unwrapped.num_last_actions
     last_actions = jnp.tile(hovering_action, (num_last_actions, 1))
     
-    # 创建初始state（使用环境的TrackStateVer8类）
-    from aquila.envs.target_trackVer8 import TrackStateVer8
-    state = TrackStateVer8(
+    # 创建初始state（使用环境的TrackStateVer10类）
+    from aquila.envs.target_trackVer10 import TrackStateVer10
+    state = TrackStateVer10(
         time=0.0,
         step_idx=0,
         quadrotor_state=quadrotor_state,
@@ -345,7 +345,7 @@ def test_policy():
     }
     
     os.makedirs('aquila/output', exist_ok=True)
-    output_file = 'aquila/output/test_trackVer8_data.pkl'
+    output_file = 'aquila/output/test_trackVer10_data.pkl'
     with open(output_file, 'wb') as f:
         pickle.dump(output_data, f)
     print(f"\n✅ Test data saved to: {output_file}")
@@ -379,7 +379,7 @@ def test_policy():
     ax1.set_xlabel('X (North) [m]')
     ax1.set_ylabel('Y (East) [m]')
     ax1.set_zlabel('Z (Down) [m]')
-    ax1.set_title('TrackVer8: Drone Tracking Trajectory (3D)', fontsize=14, fontweight='bold')
+    ax1.set_title('TrackVer10: Drone Tracking Trajectory (3D)', fontsize=14, fontweight='bold')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
@@ -393,7 +393,7 @@ def test_policy():
     ax1.set_zlim(z_range)
     
     plt.tight_layout()
-    trajectory_file = 'aquila/output/trackVer8_trajectory_3d.png'
+    trajectory_file = 'aquila/output/trackVer10_trajectory_3d.png'
     plt.savefig(trajectory_file, dpi=150, bbox_inches='tight')
     print(f"✅ 3D trajectory plot saved to: {trajectory_file}")
     plt.close()
@@ -457,7 +457,7 @@ def test_policy():
     axes[2, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    analysis_file = 'aquila/output/trackVer8_data_analysis.png'
+    analysis_file = 'aquila/output/trackVer10_data_analysis.png'
     plt.savefig(analysis_file, dpi=150, bbox_inches='tight')
     print(f"✅ Data analysis plot saved to: {analysis_file}")
     plt.close()

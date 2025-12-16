@@ -101,7 +101,7 @@ class Quadrotor:
             motor_omega_max=7000.0,  # [rad/s]
             motor_tau=0.015,  # [s] 减小以匹配SITL的更快响应
             motor_inertia=2.6e-7,  # [kgm^2]
-            omega_max=jnp.array([0.8, 0.8, 0.6]),  # [rad/s] 增加以匹配SITL的更高机动性
+            omega_max=jnp.array([1.5, 1.5, 1.2]),  # [rad/s] 增加以匹配SITL的更高机动性
             thrust_map=jnp.array([2e-7, 0.0,  0.0]),
             kappa=0.008,  # [Nm/N]
             thrust_min=0.0,  # [N]

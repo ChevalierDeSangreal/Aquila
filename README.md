@@ -5,6 +5,7 @@ To run the code:
 ```
 python aquila/scripts/train_trackVer5.py
 python aquila/scripts/train_trackVer9.py
+python aquila/scripts/train_trackVer10.py
 
 nohup python aquila/scripts/train_trackVer9.py &
 
