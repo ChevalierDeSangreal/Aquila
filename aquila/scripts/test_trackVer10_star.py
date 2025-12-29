@@ -18,7 +18,7 @@ import pickle
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.target_trackVer11 import TrackEnvVer11, ExtendedQuadrotorParams
+from aquila.envs.target_trackVer10 import TrackEnvVer10, ExtendedQuadrotorParams
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
 
@@ -134,13 +134,13 @@ def test_policy():
     
     # ==================== Load Policy ====================
     # policy_file = 'aquila/param/trackVer8_policy_stabler.pkl'
-    policy_file = 'aquila/param/trackVer11_policy.pkl'
+    policy_file = 'aquila/param/trackVer10_policy.pkl'
     params, env_config, action_repeat, buffer_size = load_trained_policy(policy_file)
     
     # ==================== Environment Setup ====================
     # 创建环境（与训练时相同的配置）
-    env = TrackEnvVer11(
-        max_steps_in_episode=1000,
+    env = TrackEnvVer10(
+        max_steps_in_episode=2000,
         dt=0.01,
         delay=0.03,
         omega_std=0.1,
@@ -151,12 +151,6 @@ def test_policy():
         target_speed_max=1.0,
         reset_distance=100.0,
         max_speed=20.0,
-        # Boundary parameters (Ver11新增)
-        boundary_x=10.0,  # m (full length in x direction)
-        boundary_y=10.0,  # m (full width in y direction)
-        boundary_z=10.0,  # m (full height in z direction)
-        boundary_penalty_distance=1.0,  # m (distance threshold for boundary penalty)
-        boundary_penalty_max=100.0,  # maximum penalty for being outside boundary
         thrust_to_weight_min=3.0,
         thrust_to_weight_max=3.1,
     )
@@ -174,7 +168,7 @@ def test_policy():
     policy = MLP([input_dim, 128, 128, action_dim], initial_scale=0.2)
     
     print(f"\n{'='*60}")
-    print(f"Testing TrackVer11 Policy")
+    print(f"Testing TrackVer10 Policy")
     print(f"{'='*60}")
     print(f"Observation dimension: {obs_dim}")
     print(f"Action dimension: {action_dim}")
@@ -213,37 +207,32 @@ def test_policy():
         dr_key=key
     )
     
-    # ==================== 圆形轨迹参数 ====================
+    # ==================== 星形轨迹参数 ====================
     # 无人机在原点 [0.0, 0.0, -2.0]，目标初始位置在正前方1m [1.0, 0.0, -2.0]
-    # 圆心位置调整，使得初始角度为0时，目标在正前方1m
-    circle_radius = 3.0  # 圆的半径 (m)
-    circle_speed = 2.0  # 圆周运动线速度 (m/s)
-    initial_angle = 0.0  # 固定初始角度为0，确保目标在正前方
-    circle_angle = initial_angle  # 当前角度（用于在循环中更新）
+    star_center = jnp.array([0.0, 0.0, -2.0])  # 星形中心位置（与无人机位置相同）
+    star_max_distance = 2.0  # 最大距离 (m)
+    star_acceleration = 0.5  # 加速度 (m/s²)
     
-    # 计算圆心位置：目标在 [1.0, 0.0, -2.0]，半径3m，角度0
-    # 圆心 = 目标位置 - 半径 * (cos(0), sin(0), 0) = [1.0, 0.0, -2.0] - [3.0, 0.0, 0.0] = [-2.0, 0.0, -2.0]
-    circle_center = jnp.array([1.0 - circle_radius, 0.0, -2.0])  # 圆心位置，确保初始时目标在正前方1m
+    # 固定初始方向为x轴正方向（正前方）
+    star_direction = jnp.array([1.0, 0.0, 0.0])  # x轴正方向
     
-    # 目标：圆形轨迹上的初始位置和速度（正前方1m）
-    target_pos = circle_center + jnp.array([
-        circle_radius * jnp.cos(initial_angle),
-        circle_radius * jnp.sin(initial_angle),
-        0.0
-    ])
-    target_vel = circle_speed * jnp.array([
-        -jnp.sin(initial_angle),
-        jnp.cos(initial_angle),
-        0.0
-    ])
-    target_direction = jnp.array([1.0, 0.0, 0.0])  # 不使用，但需要初始化
+    # 目标初始位置：正前方1m
+    target_pos = jnp.array([1.0, 0.0, -2.0])
+    target_vel = jnp.array([0.0, 0.0, 0.0])  # 初始速度为0
+    target_direction = star_direction
     
-    print(f"Circle trajectory parameters:")
-    print(f"  Center: {circle_center}")
-    print(f"  Radius: {circle_radius} m")
-    print(f"  Speed: {circle_speed} m/s")
-    print(f"  Initial angle: {initial_angle:.3f} rad")
+    # 星形轨迹状态
+    # 目标已经在距离中心1m的位置，应该继续加速离开（phase 0）
+    star_phase = 0  # 0=加速离开, 1=减速到最远, 2=加速返回, 3=减速到中心
+    star_current_speed = 0.0  # 当前速度大小（从0开始加速）
+    
+    print(f"Star trajectory parameters:")
+    print(f"  Center: {star_center}")
+    print(f"  Max distance: {star_max_distance} m")
+    print(f"  Acceleration: {star_acceleration} m/s²")
+    print(f"  Initial direction: {star_direction}")
     print(f"  Initial target position: {target_pos} (should be [1.0, 0.0, -2.0])")
+    print(f"  Initial distance from center: {jnp.linalg.norm(target_pos - star_center):.3f} m")
     
     # 计算悬停动作（使用随机化后的参数）
     thrust_hover = quad_params.mass * quad_params.gravity
@@ -253,9 +242,9 @@ def test_policy():
     num_last_actions = env.unwrapped.num_last_actions
     last_actions = jnp.tile(hovering_action, (num_last_actions, 1))
     
-    # 创建初始state（使用环境的TrackStateVer11类）
-    from aquila.envs.target_trackVer11 import TrackStateVer11
-    state = TrackStateVer11(
+    # 创建初始state（使用环境的TrackStateVer10类）
+    from aquila.envs.target_trackVer10 import TrackStateVer10
+    state = TrackStateVer10(
         time=0.0,
         step_idx=0,
         quadrotor_state=quadrotor_state,
@@ -264,15 +253,11 @@ def test_policy():
         target_vel=target_vel,
         target_direction=target_direction,
         quad_params=quad_params,
-        target_speed_max=circle_speed,  # 圆形轨迹速度
+        target_speed_max=0.0,  # 星形轨迹不使用此参数
         action_raw=jnp.zeros(4),
         filtered_acc=jnp.array([0.0, 0.0, 9.81]),
         filtered_thrust=jnp.array(thrust_hover),
         has_exceeded_distance=False,
-        # Boundary parameters (Ver11新增)
-        boundary_half_x=env.unwrapped.boundary_half_x,
-        boundary_half_y=env.unwrapped.boundary_half_y,
-        boundary_z=env.unwrapped.boundary_z,
     )
     
     # 通过reset获取正确处理（归一化）的观测
@@ -309,7 +294,7 @@ def test_policy():
     current_action = initial_action
     
     # ==================== Simulation Loop ====================
-    max_steps = 1000
+    max_steps = 2000
     
     # 数据记录
     positions = []
@@ -325,28 +310,50 @@ def test_policy():
     angles_body_x_target = []  # 目标与无人机x轴的夹角
     
     for step in range(max_steps):
-        # ==================== 更新圆形轨迹（测试代码维护）====================
+        # ==================== 更新星形轨迹 ====================
         dt = env.unwrapped.dt
-        angular_velocity = circle_speed / circle_radius
-        circle_angle = circle_angle + angular_velocity * dt
+        distance_to_center = jnp.linalg.norm(target_pos - star_center)
         
-        # 更新目标位置和速度
-        target_pos = circle_center + jnp.array([
-            circle_radius * jnp.cos(circle_angle),
-            circle_radius * jnp.sin(circle_angle),
-            0.0
-        ])
-        target_vel = circle_speed * jnp.array([
-            -jnp.sin(circle_angle),
-            jnp.cos(circle_angle),
-            0.0
-        ])
+        # 根据阶段更新速度和位置
+        if star_phase == 0:  # 加速离开
+            star_current_speed = star_current_speed + star_acceleration * dt
+            remaining_distance = star_max_distance - distance_to_center
+            decel_distance = (star_current_speed ** 2) / (2 * star_acceleration)
+            if decel_distance >= remaining_distance:
+                star_phase = 1  # 切换到减速阶段
+                
+        elif star_phase == 1:  # 减速到最远
+            star_current_speed = jnp.maximum(star_current_speed - star_acceleration * dt, 0.0)
+            if distance_to_center >= star_max_distance or star_current_speed <= 1e-6:
+                star_phase = 2  # 切换到返回加速阶段
+                
+        elif star_phase == 2:  # 加速返回
+            star_current_speed = star_current_speed + star_acceleration * dt
+            decel_distance = (star_current_speed ** 2) / (2 * star_acceleration)
+            if decel_distance >= distance_to_center:
+                star_phase = 3  # 切换到返回减速阶段
+                
+        else:  # star_phase == 3: 减速到中心
+            star_current_speed = jnp.maximum(star_current_speed - star_acceleration * dt, 0.0)
+            if distance_to_center <= 0.1:  # 10cm以内算到达中心
+                # 随机生成新的水平方向并重新开始
+                key, _ = jax.random.split(key)  # 更新key用于生成新方向
+                new_angle = jax.random.uniform(key, shape=(), minval=0.0, maxval=2.0 * jnp.pi)
+                star_direction = jnp.array([jnp.cos(new_angle), jnp.sin(new_angle), 0.0])
+                star_current_speed = 0.0
+                star_phase = 0
+        
+        # 计算速度方向（phase 0和1向外，phase 2和3向内）
+        direction_multiplier = 1.0 if (star_phase == 0 or star_phase == 1) else -1.0
+        target_vel = star_current_speed * direction_multiplier * star_direction
+        target_pos = target_pos + target_vel * dt
         
         # 更新state中的目标位置和速度
         state = dataclasses.replace(
             state,
             target_pos=target_pos,
             target_vel=target_vel,
+            target_direction=star_direction,
         )
         
         # ==================== 动作选择（与训练时完全一致）====================
@@ -448,7 +455,7 @@ def test_policy():
     }
     
     os.makedirs('aquila/output', exist_ok=True)
-    output_file = 'aquila/output/test_trackVer11_data.pkl'
+    output_file = 'aquila/output/test_trackVer10_data.pkl'
     with open(output_file, 'wb') as f:
         pickle.dump(output_data, f)
     print(f"\n✅ Test data saved to: {output_file}")
@@ -482,7 +489,7 @@ def test_policy():
     ax1.set_xlabel('X (North) [m]')
     ax1.set_ylabel('Y (East) [m]')
     ax1.set_zlabel('Z (Down) [m]')
-    ax1.set_title('TrackVer11: Drone Tracking Trajectory (3D)', fontsize=14, fontweight='bold')
+    ax1.set_title('TrackVer10: Drone Tracking Trajectory (3D)', fontsize=14, fontweight='bold')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
@@ -496,7 +503,7 @@ def test_policy():
     ax1.set_zlim(z_range)
     
     plt.tight_layout()
-    trajectory_file = 'aquila/output/trackVer11_trajectory_3d.png'
+    trajectory_file = 'aquila/output/trackVer10_trajectory_3d.png'
     plt.savefig(trajectory_file, dpi=150, bbox_inches='tight')
     print(f"✅ 3D trajectory plot saved to: {trajectory_file}")
     plt.close()
@@ -575,7 +582,7 @@ def test_policy():
     axes[3, 1].axis('off')
     
     plt.tight_layout()
-    analysis_file = 'aquila/output/trackVer11_data_analysis.png'
+    analysis_file = 'aquila/output/trackVer10_data_analysis.png'
     plt.savefig(analysis_file, dpi=150, bbox_inches='tight')
     print(f"✅ Data analysis plot saved to: {analysis_file}")
     plt.close()

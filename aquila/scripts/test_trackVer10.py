@@ -5,7 +5,7 @@ import os
 import sys
 
 # ==================== GPU Configuration ====================
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/usr/local/cuda'
 
 import jax
@@ -176,9 +176,9 @@ def test_policy():
         dr_key=key
     )
     
-    # 目标：正前方0.5m处，静止
+    # 目标：正前方0.5m处，以0.5m/s速度沿x方向匀速运动
     target_pos = jnp.array([1, 0.0, -2.0])
-    target_vel = jnp.zeros(3)
+    target_vel = jnp.array([1, 0.0, 0.0])  # 0.5m/s沿x方向
     target_direction = jnp.array([1.0, 0.0, 0.0])  # x方向
     
     # 计算悬停动作（使用随机化后的参数）
@@ -200,7 +200,7 @@ def test_policy():
         target_vel=target_vel,
         target_direction=target_direction,
         quad_params=quad_params,
-        target_speed_max=0.0,  # 目标静止
+        target_speed_max=5,  # 目标以0.5m/s速度运动
         action_raw=jnp.zeros(4),
         filtered_acc=jnp.array([0.0, 0.0, 9.81]),
         filtered_thrust=jnp.array(thrust_hover),

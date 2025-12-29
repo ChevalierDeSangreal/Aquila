@@ -5,29 +5,22 @@ import os
 import sys
 
 # ==================== GPU Configuration ====================
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/usr/local/cuda'
 
-import time
+import dataclasses
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import numpy as np
 import pickle
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from mpl_toolkits.mplot3d import Axes3D
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.target_trackVer10 import TrackEnvVer10
+from aquila.envs.target_trackVer10 import TrackEnvVer10, ExtendedQuadrotorParams
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
-from aquila.utils.trajectory_utils import (
-    TrajectoryGenerator,
-    CircularTrajectory,
-    create_trajectory
-)
 
 
 def load_trained_policy(checkpoint_path):
@@ -40,18 +33,18 @@ def load_trained_policy(checkpoint_path):
     if isinstance(data, dict):
         params = data['params']
         env_config = data.get('env_config', {})
+        action_repeat = data.get('action_repeat', 10)
+        buffer_size = data.get('action_obs_buffer_size', 10)
         final_loss = data.get('final_loss', 'Unknown')
-        training_epochs = data.get('training_epochs', 'Unknown')
-        action_repeat = data.get('action_repeat', 10)  # Ver10默认值
-        buffer_size = data.get('action_obs_buffer_size', 10)  # Ver10默认值
+        training_epochs = data.get('num_epochs', 'Unknown')
     else:
         # 兼容旧格式
         params = data
         env_config = {}
+        action_repeat = 10
+        buffer_size = 10
         final_loss = 'Unknown'
         training_epochs = 'Unknown'
-        action_repeat = 10  # Ver10默认值
-        buffer_size = 10  # Ver10默认值
     
     print("✅ Policy parameters loaded successfully!")
     print(f"   Final loss: {final_loss}")
@@ -62,606 +55,537 @@ def load_trained_policy(checkpoint_path):
     return params, env_config, action_repeat, buffer_size
 
 
-def ensure_trajectory_reasonable(trajectory: CircularTrajectory) -> CircularTrajectory:
-    """
-    确保圆形轨迹参数合理（Ver10没有边界约束，只需确保参数在合理范围内）
+def get_action_from_policy(policy, params, action_obs_buffer):
+    """从策略网络获取动作
     
     Args:
-        trajectory: 原始圆形轨迹生成器
-        
+        policy: MLP策略网络
+        params: 网络参数
+        action_obs_buffer: 动作-状态缓冲区，形状 (buffer_size, obs_dim + action_dim)
+    
     Returns:
-        调整后的轨迹生成器（新实例，不修改原实例）
+        action: 归一化后的动作 (4,)，范围 [-1, 1]
     """
-    # Ver10没有边界约束，只需确保轨迹参数合理
-    # 确保半径在合理范围内
-    adjusted_radius = np.clip(trajectory.radius, 0.5, 10.0)
-    
-    # 确保z坐标在合理范围内（NED坐标系，z通常为负值）
-    center_z = np.clip(trajectory.center_z, -10.0, -0.5)
-    
-    # 创建新的圆形轨迹
-    return CircularTrajectory(
-        center=(float(trajectory.center_x), float(trajectory.center_y), float(center_z)),
-        radius=float(adjusted_radius),
-        num_circles=trajectory.num_circles,
-        ramp_up_time=trajectory.ramp_up_time,
-        ramp_down_time=trajectory.ramp_down_time,
-        circle_duration=trajectory.circle_duration,
-        init_phase=trajectory.init_phase,
-        max_speed=trajectory.max_speed
-    )
+    # 展平缓冲区作为网络输入
+    buffer_flat = action_obs_buffer.reshape(-1)
+    # 获取动作
+    action = policy.apply(params, buffer_flat)
+    return action
 
 
-def run_test_episode(env, policy_apply, params, key, action_repeat, buffer_size, 
-                     trajectory: CircularTrajectory = None, verbose=False):
-    """
-    运行一个测试episode，记录跟踪信息（Ver10没有边界约束）
+def normalize_hovering_action(hovering_action_raw, thrust_min, thrust_max, omega_max):
+    """将原始悬停动作归一化到 [-1, 1] 范围
     
     Args:
-        env: 环境实例
-        policy_apply: 策略应用函数
-        params: 策略参数
-        key: JAX随机数生成器密钥
-        action_repeat: 动作重复次数
-        buffer_size: 动作-观测缓冲区大小
-        trajectory: 圆形轨迹生成器，如果提供则覆盖环境的默认目标运动
-        verbose: 是否打印详细信息
+        hovering_action_raw: 原始悬停动作 [thrust, wx, wy, wz]
+        thrust_min: 推力最小值
+        thrust_max: 推力最大值
+        omega_max: 角速度最大值
+    
+    Returns:
+        归一化后的悬停动作
     """
-    # Reset environment（先reset获取基本状态结构）
-    state, obs = env.reset(key)
+    thrust_raw = hovering_action_raw[0]
+    omega_raw = hovering_action_raw[1:]
     
-    # 如果提供了轨迹生成器，先确保轨迹参数合理，然后根据轨迹初始化
-    if trajectory is not None:
-        # 1. 确保轨迹参数合理（Ver10没有边界约束）
-        trajectory = ensure_trajectory_reasonable(trajectory)
-        
-        # 2. 获取轨迹的初始位置（t=0时）
-        target_initial_pos, target_initial_vel = trajectory.get_state(0.0)
-        target_initial_pos = np.array(target_initial_pos)  # 转换为numpy以便计算
-        target_initial_vel = jnp.array(target_initial_vel)
-        
-        # 3. 根据目标初始位置，初始化无人机在目标正后方1m处（NED坐标系，-X方向）
-        # 这样目标就在无人机正前方1m处
-        quad_initial_pos_np = target_initial_pos - np.array([1.0, 0.0, 0.0])  # 正后方1m
-        quad_initial_pos = jnp.array(quad_initial_pos_np)
-        target_initial_pos = jnp.array(target_initial_pos)
-        
-        # 4. 更新state中的目标位置、速度和无人机位置
-        import dataclasses
-        from aquila.objects.quadrotor_obj import QuadrotorState
-        
-        # 更新无人机状态（保持其他属性不变，只更新位置）
-        new_quadrotor_state = dataclasses.replace(
-            state.quadrotor_state,
-            p=quad_initial_pos
-        )
-        
-        # 更新整个state
-        state = dataclasses.replace(
-            state,
-            quadrotor_state=new_quadrotor_state,
-            target_pos=target_initial_pos,
-            target_vel=target_initial_vel
-        )
-        
-        # 5. 重新计算观测
-        obs = env._get_obs(state)
+    # 推力归一化：[thrust_min*4, thrust_max*4] -> [-1, 1]
+    action_low_thrust = thrust_min * 4
+    action_high_thrust = thrust_max * 4
+    thrust_normalized = 2.0 * (thrust_raw - action_low_thrust) / (action_high_thrust - action_low_thrust) - 1.0
     
-    # 初始化动作-状态缓冲区
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    # 角速度归一化：[-omega_max, omega_max] -> [-1, 1]
+    omega_normalized = omega_raw / omega_max
     
-    # ⚠️ 重要：缓冲区格式必须与训练时一致：[action, obs]（先动作，后观测）
-    # 缓冲区形状：(buffer_size, action_dim + obs_dim)
-    action_obs_buffer = jnp.zeros((buffer_size, action_dim + obs_dim))
-    
-    # 初始化：填充零动作和零观测（与训练时的初始化一致）
-    zero_action = jnp.zeros(action_dim)
-    zero_obs = jnp.zeros(obs_dim)
-    action_obs_combined = jnp.concatenate([zero_action, zero_obs])
-    action_obs_buffer = jnp.tile(action_obs_combined[None, :], (buffer_size, 1))
-    
-    # Episode statistics
-    episode_data = {
-        'quad_positions': [],
-        'target_positions': [],
-        'distances': [],
-        'rewards': [],
-        'actions': [],
-        'velocities': [],
-        'terminated': False,
-        'truncated': False,
-        'num_steps': 0,
-    }
-    
-    done = False
-    step_count = 0
-    action = jnp.zeros(action_dim)  # 初始动作为零
-    action_counter = 0  # 动作计数器，用于action_repeat
-    
-    # 如果提供了轨迹生成器，记录轨迹起始时间
-    trajectory_start_time = 0.0 if trajectory else None
-    
-    while not done and step_count < env.max_steps_in_episode:
-        # 每action_repeat步获取一次新动作
-        if action_counter % action_repeat == 0:
-            # ⚠️ 与训练时一致的逻辑：
-            # 步骤1：先用空动作+当前观测更新缓冲区（为获取新动作做准备）
-            action_obs_buffer_for_input = jnp.roll(action_obs_buffer, shift=-1, axis=0)
-            empty_action = jnp.zeros(action_dim)
-            action_obs_combined_empty = jnp.concatenate([empty_action, obs])
-            action_obs_buffer_for_input = action_obs_buffer_for_input.at[-1].set(action_obs_combined_empty)
-            
-            # 步骤2：展平缓冲区作为网络输入：[action[0], obs[0], action[1], obs[1], ...]
-            network_input = action_obs_buffer_for_input.flatten()
-            
-            # 步骤3：获取新动作
-            action = policy_apply(params, network_input)
-            
-            # 步骤4：用获取到的新动作更新缓冲区（用于下次使用）
-            action_obs_buffer = jnp.roll(action_obs_buffer, shift=-1, axis=0)
-            action_obs_combined_new = jnp.concatenate([action, obs])
-            action_obs_buffer = action_obs_buffer.at[-1].set(action_obs_combined_new)
-        
-        # 执行动作
-        key, subkey = jax.random.split(key)
-        transition = env.step(state, action, subkey)
-        next_state, next_obs, reward, terminated, truncated, info = transition
-        
-        # 如果提供了轨迹生成器，覆盖目标位置和速度
-        if trajectory is not None:
-            current_time = trajectory_start_time + step_count * env.dt
-            traj_pos, traj_vel = trajectory.get_state(current_time)
-            
-            # 更新状态中的目标位置和速度（Ver10没有边界约束）
-            import dataclasses
-            next_state = dataclasses.replace(
-                next_state,
-                target_pos=traj_pos,
-                target_vel=traj_vel
-            )
-            
-            # 重新计算观测（因为目标位置改变了）
-            next_obs = env._get_obs(next_state)
-        
-        # 记录数据
-        quad_pos = np.array(info['quad_p'])
-        target_pos = np.array(info['target_p'])
-        distance = np.array(info['distance_to_target'])
-        
-        episode_data['quad_positions'].append(quad_pos)
-        episode_data['target_positions'].append(target_pos)
-        episode_data['distances'].append(distance)
-        episode_data['rewards'].append(float(reward))
-        episode_data['actions'].append(np.array(action))
-        episode_data['velocities'].append(np.array(info['quad_v']))
-        episode_data['target_velocities'] = episode_data.get('target_velocities', [])
-        episode_data['target_velocities'].append(np.array(info['target_v']))
-        
-        # 更新状态和观测
-        state = next_state
-        obs = next_obs  # 更新obs以便下次获取动作时使用
-        done = terminated or truncated
-        step_count += 1
-        action_counter += 1
-        
-        if verbose and step_count % 100 == 0:
-            print(f"  Step {step_count}: Distance={distance:.3f}m, Reward={reward:.3f}")
-    
-    episode_data['terminated'] = bool(terminated)
-    episode_data['truncated'] = bool(truncated)
-    episode_data['num_steps'] = step_count
-    
-    return episode_data
+    return jnp.concatenate([jnp.array([thrust_normalized]), omega_normalized])
 
 
-def visualize_episode(episode_data, episode_idx=0, save_path=None):
-    """可视化单个episode的结果（Ver10没有边界约束）"""
-    fig = plt.figure(figsize=(24, 16))
+def compute_angle_between_body_x_and_target(quad_R, quad_pos, target_pos):
+    """计算无人机x轴与到目标物体方向的夹角（度数）
     
-    # 1. 3D轨迹图
-    ax1 = fig.add_subplot(3, 3, 1, projection='3d')
-    quad_positions = np.array(episode_data['quad_positions'])
-    target_positions = np.array(episode_data['target_positions'])
+    Args:
+        quad_R: 无人机的旋转矩阵 (3x3)
+        quad_pos: 无人机位置 (3,)
+        target_pos: 目标位置 (3,)
     
-    ax1.plot(quad_positions[:, 0], quad_positions[:, 1], quad_positions[:, 2], 
-             'b-', label='Quadrotor', linewidth=2, alpha=0.7)
-    ax1.plot(target_positions[:, 0], target_positions[:, 1], target_positions[:, 2], 
-             'r--', label='Target', linewidth=2, alpha=0.7)
-    
-    ax1.set_xlabel('X (North) [m]')
-    ax1.set_ylabel('Y (East) [m]')
-    ax1.set_zlabel('Z (Down) [m]')
-    ax1.set_title(f'Episode {episode_idx}: 3D Trajectory (NED frame)')
-    ax1.legend()
-    ax1.grid(True)
-    
-    # 设置坐标轴范围（基于实际轨迹范围）
-    all_pos = np.vstack([quad_positions, target_positions])
-    x_range = [all_pos[:, 0].min() - 1.0, all_pos[:, 0].max() + 1.0]
-    y_range = [all_pos[:, 1].min() - 1.0, all_pos[:, 1].max() + 1.0]
-    z_range = [all_pos[:, 2].min() - 1.0, all_pos[:, 2].max() + 1.0]
-    ax1.set_xlim(x_range)
-    ax1.set_ylim(y_range)
-    ax1.set_zlim(z_range)
-    
-    # 2. XY平面投影（俯视图）
-    ax2 = fig.add_subplot(3, 3, 2)
-    ax2.plot(quad_positions[:, 0], quad_positions[:, 1], 'b-', label='Quadrotor', linewidth=2, alpha=0.7)
-    ax2.plot(target_positions[:, 0], target_positions[:, 1], 'r--', label='Target', linewidth=2, alpha=0.7)
-    
-    ax2.set_xlabel('X (North) [m]')
-    ax2.set_ylabel('Y (East) [m]')
-    ax2.set_title(f'Episode {episode_idx}: Top View (XY plane)')
-    ax2.legend()
-    ax2.grid(True)
-    ax2.axis('equal')
-    
-    # 3. 跟踪距离随时间变化
-    ax3 = fig.add_subplot(3, 3, 3)
-    distances = np.array(episode_data['distances'])
-    ax3.plot(distances, 'b-', linewidth=2)
-    ax3.axhline(y=1.0, color='r', linestyle='--', label='Target Distance (1m)')
-    ax3.axhline(y=1.3, color='orange', linestyle=':', label='Acceptable Range (±30cm)')
-    ax3.axhline(y=0.7, color='orange', linestyle=':')
-    ax3.set_xlabel('Step')
-    ax3.set_ylabel('Distance to Target [m]')
-    ax3.set_title(f'Episode {episode_idx}: Tracking Distance')
-    ax3.legend()
-    ax3.grid(True)
-    
-    # 4. XZ平面投影（侧视图）
-    ax4 = fig.add_subplot(3, 3, 4)
-    ax4.plot(quad_positions[:, 0], quad_positions[:, 2], 'b-', label='Quadrotor', linewidth=2, alpha=0.7)
-    ax4.plot(target_positions[:, 0], target_positions[:, 2], 'r--', label='Target', linewidth=2, alpha=0.7)
-    ax4.set_xlabel('X (North) [m]')
-    ax4.set_ylabel('Z (Down) [m]')
-    ax4.set_title(f'Episode {episode_idx}: Side View (XZ plane)')
-    ax4.legend()
-    ax4.grid(True)
-    ax4.axis('equal')
-    
-    # 5. 奖励随时间变化
-    ax5 = fig.add_subplot(3, 3, 5)
-    rewards = np.array(episode_data['rewards'])
-    ax5.plot(rewards, 'purple', linewidth=2)
-    ax5.set_xlabel('Step')
-    ax5.set_ylabel('Reward')
-    ax5.set_title(f'Episode {episode_idx}: Rewards')
-    ax5.grid(True)
-    
-    # 6. 目标物体速度随时间变化
-    ax6 = fig.add_subplot(3, 3, 6)
-    target_velocities = np.array(episode_data.get('target_velocities', []))
-    if len(target_velocities) > 0:
-        target_speed = np.linalg.norm(target_velocities, axis=1)
-        ax6.plot(target_speed, 'r-', linewidth=2, label='Target Speed')
-        ax6.axhline(y=1.0, color='orange', linestyle='--', linewidth=1, label='Max Speed (1 m/s)')
-        ax6.set_xlabel('Step')
-        ax6.set_ylabel('Speed [m/s]')
-        ax6.set_title(f'Episode {episode_idx}: Target Speed')
-        ax6.legend()
-        ax6.grid(True)
-        ax6.set_ylim(bottom=0)
-    
-    # 7. 无人机速度随时间变化
-    ax7 = fig.add_subplot(3, 3, 7)
-    velocities = np.array(episode_data['velocities'])
-    quad_speed = np.linalg.norm(velocities, axis=1)
-    ax7.plot(quad_speed, 'b-', linewidth=2, label='Quad Speed')
-    ax7.set_xlabel('Step')
-    ax7.set_ylabel('Speed [m/s]')
-    ax7.set_title(f'Episode {episode_idx}: Quadrotor Speed')
-    ax7.legend()
-    ax7.grid(True)
-    ax7.set_ylim(bottom=0)
-    
-    # 8. 目标速度向量（3个分量）
-    ax8 = fig.add_subplot(3, 3, 8)
-    if len(target_velocities) > 0:
-        ax8.plot(target_velocities[:, 0], 'r-', alpha=0.7, label='Vx (North)', linewidth=1.5)
-        ax8.plot(target_velocities[:, 1], 'g-', alpha=0.7, label='Vy (East)', linewidth=1.5)
-        ax8.plot(target_velocities[:, 2], 'b-', alpha=0.7, label='Vz (Down)', linewidth=1.5)
-        ax8.set_xlabel('Step')
-        ax8.set_ylabel('Velocity [m/s]')
-        ax8.set_title(f'Episode {episode_idx}: Target Velocity Components')
-        ax8.legend()
-        ax8.grid(True)
-    
-    # 9. 统计信息文本
-    ax9 = fig.add_subplot(3, 3, 9)
-    ax9.axis('off')
-    
-    mean_distance = np.mean(distances)
-    std_distance = np.std(distances)
-    min_distance = np.min(distances)
-    max_distance = np.max(distances)
-    mean_reward = np.mean(rewards)
-    total_reward = np.sum(rewards)
-    
-    # 计算跟踪成功率（距离在目标±30cm内的比例）
-    tracking_success_rate = np.mean(np.abs(distances - 1.0) < 0.3) * 100
-    
-    # 计算目标速度统计
-    target_velocities = np.array(episode_data.get('target_velocities', []))
-    if len(target_velocities) > 0:
-        target_speed = np.linalg.norm(target_velocities, axis=1)
-        mean_target_speed = np.mean(target_speed)
-        max_target_speed = np.max(target_speed)
-    else:
-        mean_target_speed = 0.0
-        max_target_speed = 0.0
-    
-    stats_text = f"""
-    Episode {episode_idx} Statistics:
-    
-    Steps: {episode_data['num_steps']}
-    Terminated: {episode_data['terminated']}
-    Truncated: {episode_data['truncated']}
-    
-    Tracking Performance:
-    • Mean Distance: {mean_distance:.3f} m
-    • Std Distance: {std_distance:.3f} m
-    • Min Distance: {min_distance:.3f} m
-    • Max Distance: {max_distance:.3f} m
-    • Success Rate (±30cm): {tracking_success_rate:.1f}%
-    
-    Target Motion:
-    • Mean Speed: {mean_target_speed:.3f} m/s
-    • Max Speed: {max_target_speed:.3f} m/s
-    
-    Rewards:
-    • Mean Reward: {mean_reward:.3f}
-    • Total Reward: {total_reward:.3f}
+    Returns:
+        夹角（度数）
     """
+    # 机体x轴在世界坐标系中的方向（NED坐标系中，机体x轴向前）
+    body_x_world = quad_R @ jnp.array([1.0, 0.0, 0.0])
     
-    ax9.text(0.1, 0.5, stats_text, fontsize=10, verticalalignment='center',
-             family='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    # 从无人机到目标的方向向量
+    direction_to_target = target_pos - quad_pos
+    direction_norm = jnp.linalg.norm(direction_to_target)
+    direction_to_target_normalized = direction_to_target / (direction_norm + 1e-8)
     
-    plt.tight_layout()
+    # 计算夹角的余弦值
+    cos_angle = jnp.dot(body_x_world, direction_to_target_normalized)
+    cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
     
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  Visualization saved to: {save_path}")
+    # 转换为角度
+    angle_rad = jnp.arccos(cos_angle)
+    angle_deg = jnp.degrees(angle_rad)
     
-    return fig
+    return angle_deg
 
 
-def main():
-    # ==================== Configuration ====================
-    print(f"JAX devices: {jax.devices()}")
-    print(f"JAX device count: {jax.device_count()}")
+def test_policy():
+    """测试训练好的策略"""
     
-    # ==================== Circular Trajectory Setup ====================
-    # 创建居中的圆形轨迹
-    # 参数会在环境创建后根据边界进行调整
-    trajectory = create_trajectory(
-        'circular',
-        center=(0.0, 0.0, -2.0),  # 临时中心，会根据边界调整
-        radius=2.0,                # 半径（米），会根据边界调整
-        num_circles=2,             # 圆圈数量
-        ramp_up_time=3.0,          # 加速时间（秒）
-        ramp_down_time=3.0,        # 减速时间（秒）
-        circle_duration=20.0,      # 单圈名义持续时间（秒）
-        init_phase=0.0,            # 初始相位（弧度）
-        max_speed=1.0              # 最大速度限制（m/s）
-    )
-    
-    print(f"\n{'='*60}")
-    print(f"Circular Trajectory Configuration:")
-    print(f"{'='*60}")
-    traj_info = trajectory.get_info()
-    for key, value in traj_info.items():
-        print(f"  {key}: {value}")
-    print(f"Note: Trajectory parameters will be adjusted to reasonable ranges")
-    print(f"{'='*60}\n")
-    
-    # Load trained policy
+    # ==================== Load Policy ====================
+    # policy_file = 'aquila/param/trackVer8_policy_stabler.pkl'
     policy_file = 'aquila/param/trackVer10_policy.pkl'
-    
-    if not os.path.exists(policy_file):
-        print(f"❌ Error: Policy file not found: {policy_file}")
-        print("   Please train the model first using train_trackVer10.py")
-        return
-    
     params, env_config, action_repeat, buffer_size = load_trained_policy(policy_file)
     
     # ==================== Environment Setup ====================
-    # Create env with same configuration as training (Ver10没有边界约束)
+    # 创建环境（与训练时相同的配置）
     env = TrackEnvVer10(
-        max_steps_in_episode=env_config.get('max_steps_in_episode', 1000),
-        dt=env_config.get('dt', 0.01),
-        delay=env_config.get('delay', 0.03),
+        max_steps_in_episode=2000,
+        dt=0.01,
+        delay=0.03,
         omega_std=0.1,
-        action_penalty_weight=env_config.get('action_penalty_weight', 0.5),
-        target_height=env_config.get('target_height', 2.0),
-        target_init_distance_min=env_config.get('target_init_distance_min', 0.5),
-        target_init_distance_max=env_config.get('target_init_distance_max', 1.5),
-        target_speed_max=env_config.get('target_speed_max', 1.0),
-        reset_distance=env_config.get('reset_distance', 100.0),
-        max_speed=env_config.get('max_speed', 20.0),
-        thrust_to_weight_min=env_config.get('thrust_to_weight_min', 1.2),
-        thrust_to_weight_max=env_config.get('thrust_to_weight_max', 5.0),
-        disturbance_mag=0.0,  # 测试时关闭扰动
+        action_penalty_weight=0.5,
+        target_height=2.0,
+        target_init_distance_min=0.5,
+        target_init_distance_max=1.5,
+        target_speed_max=1.0,
+        reset_distance=100.0,
+        max_speed=20.0,
+        thrust_to_weight_min=3.0,
+        thrust_to_weight_max=3.1,
     )
     
-    # Apply wrappers
+    # 应用与训练时相同的wrapper
     env = MinMaxObservationWrapper(env)
     env = NormalizeActionWrapper(env)
     
     # ==================== Model Setup ====================
-    obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
+    obs_dim = env.observation_space.shape[0]
     input_dim = buffer_size * (obs_dim + action_dim)
     
+    # 创建与训练时相同的网络
     policy = MLP([input_dim, 128, 128, action_dim], initial_scale=0.2)
     
     print(f"\n{'='*60}")
-    print(f"Test Configuration:")
+    print(f"Testing TrackVer10 Policy")
     print(f"{'='*60}")
-    print(f"Environment: TrackEnvVer10 (no boundary constraints)")
     print(f"Observation dimension: {obs_dim}")
     print(f"Action dimension: {action_dim}")
-    print(f"Action repeat: {action_repeat}")
     print(f"Action-obs buffer size: {buffer_size}")
     print(f"Input dimension: {input_dim}")
-    print(f"Disturbance: DISABLED (for testing)")
+    print(f"Action repeat: {action_repeat}")
     print(f"{'='*60}\n")
     
-    # ==================== Run Test Episodes ====================
-    num_test_episodes = 1
-    print(f"Running {num_test_episodes} test episode...\n")
+    # ==================== Custom Initialization ====================
+    key = jax.random.key(42)
     
-    key = jax.random.key(42)  # 使用固定种子以便复现
+    # 先调用一次reset获取环境中随机化好的参数
+    temp_key, key = jax.random.split(key)
+    temp_state, _ = env.reset(temp_key)
+    # 从返回的state中提取随机化后的quad_params
+    quad_params = temp_state.quad_params
     
-    all_episode_data = []
+    print(f"Using randomized quadrotor parameters:")
+    print(f"  thrust_max: {quad_params.thrust_max:.3f} N")
+    print(f"  omega_max: {quad_params.omega_max}")
+    print(f"  motor_tau: {quad_params.motor_tau:.4f} s")
+    print(f"  mass: {quad_params.mass:.3f} kg")
+    print(f"  gravity: {quad_params.gravity:.2f} m/s²")
     
-    for episode_idx in range(num_test_episodes):
-        print(f"Episode {episode_idx + 1}/{num_test_episodes}:")
-        key, subkey = jax.random.split(key)
+    # 创建自定义初始状态
+    # 无人机：原点，静止，高度2m（NED坐标系中z=-2）
+    quad_p = jnp.array([0.0, 0.0, -2.0])
+    quad_v = jnp.zeros(3)
+    quad_R = jnp.eye(3)  # 无旋转
+    quad_omega = jnp.zeros(3)
+    
+    # 创建 quadrotor state
+    quadrotor_state = env.unwrapped.quadrotor.create_state(
+        quad_p, quad_R, quad_v, 
+        omega=quad_omega, 
+        dr_key=key
+    )
+    
+    # ==================== 圆形轨迹参数 ====================
+    # 无人机在原点 [0.0, 0.0, -2.0]，目标初始位置在正前方1m [1.0, 0.0, -2.0]
+    # 圆心位置调整，使得初始角度为0时，目标在正前方1m
+    circle_radius = 2.0  # 圆的半径 (m)
+    circle_speed = 1.0  # 圆周运动线速度 (m/s)
+    initial_angle = 0.0  # 固定初始角度为0，确保目标在正前方
+    circle_angle = initial_angle  # 当前角度（用于在循环中更新）
+    
+    # 计算圆心位置：目标在 [1.0, 0.0, -2.0]，半径3m，角度0
+    # 圆心 = 目标位置 - 半径 * (cos(0), sin(0), 0) = [1.0, 0.0, -2.0] - [3.0, 0.0, 0.0] = [-2.0, 0.0, -2.0]
+    circle_center = jnp.array([1.0 - circle_radius, 0.0, -2.0])  # 圆心位置，确保初始时目标在正前方1m
+    
+    # 目标：圆形轨迹上的初始位置和速度（正前方1m）
+    target_pos = circle_center + jnp.array([
+        circle_radius * jnp.cos(initial_angle),
+        circle_radius * jnp.sin(initial_angle),
+        0.0
+    ])
+    target_vel = circle_speed * jnp.array([
+        -jnp.sin(initial_angle),
+        jnp.cos(initial_angle),
+        0.0
+    ])
+    target_direction = jnp.array([1.0, 0.0, 0.0])  # 不使用，但需要初始化
+    
+    print(f"Circle trajectory parameters:")
+    print(f"  Center: {circle_center}")
+    print(f"  Radius: {circle_radius} m")
+    print(f"  Speed: {circle_speed} m/s")
+    print(f"  Initial angle: {initial_angle:.3f} rad")
+    print(f"  Initial target position: {target_pos} (should be [1.0, 0.0, -2.0])")
+    
+    # 计算悬停动作（使用随机化后的参数）
+    thrust_hover = quad_params.mass * quad_params.gravity
+    hovering_action = jnp.array([thrust_hover, 0.0, 0.0, 0.0])
+    
+    # 初始化last_actions
+    num_last_actions = env.unwrapped.num_last_actions
+    last_actions = jnp.tile(hovering_action, (num_last_actions, 1))
+    
+    # 创建初始state（使用环境的TrackStateVer10类）
+    from aquila.envs.target_trackVer10 import TrackStateVer10
+    state = TrackStateVer10(
+        time=0.0,
+        step_idx=0,
+        quadrotor_state=quadrotor_state,
+        last_actions=last_actions,
+        target_pos=target_pos,
+        target_vel=target_vel,
+        target_direction=target_direction,
+        quad_params=quad_params,
+        target_speed_max=circle_speed,  # 圆形轨迹速度
+        action_raw=jnp.zeros(4),
+        filtered_acc=jnp.array([0.0, 0.0, 9.81]),
+        filtered_thrust=jnp.array(thrust_hover),
+        has_exceeded_distance=False,
+    )
+    
+    # 通过reset获取正确处理（归一化）的观测
+    state, obs = env.reset(key, state)
+    
+    print(f"Initial quad position: {state.quadrotor_state.p}")
+    print(f"Initial target position: {state.target_pos}")
+    print(f"Initial distance: {jnp.linalg.norm(state.quadrotor_state.p - state.target_pos):.3f}m")
+    print(f"Target velocity: {state.target_vel}")
+    print(f"\nStarting simulation...\n")
+    
+    # ==================== 初始化动作-状态缓冲区（与训练时完全一致）====================
+    # 获取归一化的悬停动作
+    thrust_min = env.unwrapped.thrust_min
+    thrust_max = quad_params.thrust_max
+    omega_max_val = quad_params.omega_max
+    if isinstance(omega_max_val, jnp.ndarray) and omega_max_val.ndim > 0:
+        omega_max_val = omega_max_val[0]
+    
+    hovering_action_normalized = normalize_hovering_action(
+        hovering_action, thrust_min, thrust_max, omega_max_val
+    )
+    
+    # 初始化缓冲区：使用零向量作为观测填充（与训练时一致）
+    zero_obs = jnp.zeros_like(obs)  # 使用零向量代替实际观测
+    action_obs_combined = jnp.concatenate([hovering_action_normalized, zero_obs])
+    action_obs_buffer = jnp.tile(action_obs_combined[None, :], (buffer_size, 1))
+    
+    # 在初始化时获取第一个动作（使用填充的缓冲区）
+    initial_action = get_action_from_policy(policy, params, action_obs_buffer)
+    
+    # 初始化动作计数器
+    action_counter = 0
+    current_action = initial_action
+    
+    # ==================== Simulation Loop ====================
+    max_steps = 2000
+    
+    # 数据记录
+    positions = []
+    target_positions = []
+    velocities = []
+    accelerations = []
+    actions_thrust = []
+    actions_omega = []
+    rewards = []
+    distances = []
+    times = []
+    heights = []
+    angles_body_x_target = []  # 目标与无人机x轴的夹角
+    
+    for step in range(max_steps):
+        # ==================== 更新圆形轨迹（测试代码维护）====================
+        dt = env.unwrapped.dt
+        angular_velocity = circle_speed / circle_radius
+        circle_angle = circle_angle + angular_velocity * dt
         
-        episode_data = run_test_episode(
-            env, policy.apply, params, subkey, 
-            action_repeat, buffer_size, 
-            trajectory=trajectory,  # 传递轨迹生成器
-            verbose=True
+        # 更新目标位置和速度
+        target_pos = circle_center + jnp.array([
+            circle_radius * jnp.cos(circle_angle),
+            circle_radius * jnp.sin(circle_angle),
+            0.0
+        ])
+        target_vel = circle_speed * jnp.array([
+            -jnp.sin(circle_angle),
+            jnp.cos(circle_angle),
+            0.0
+        ])
+        
+        # 更新state中的目标位置和速度
+        state = dataclasses.replace(
+            state,
+            target_pos=target_pos,
+            target_vel=target_vel,
         )
         
-        all_episode_data.append(episode_data)
+        # ==================== 动作选择（与训练时完全一致）====================
+        # 每action_repeat步才获取一次新动作
+        if action_counter % action_repeat == 0:
+            # 步骤1：用空动作+当前观测更新缓冲区
+            action_obs_buffer_for_input = jnp.roll(action_obs_buffer, shift=-1, axis=0)
+            empty_action = jnp.zeros(4)
+            action_obs_combined_empty = jnp.concatenate([empty_action, obs])
+            action_obs_buffer_for_input = action_obs_buffer_for_input.at[-1, :].set(action_obs_combined_empty)
+            
+            # 步骤2：获取新动作
+            current_action = get_action_from_policy(policy, params, action_obs_buffer_for_input)
+            
+            # 步骤3：用新动作+当前观测更新缓冲区
+            action_obs_buffer = jnp.roll(action_obs_buffer, shift=-1, axis=0)
+            action_obs_combined_new = jnp.concatenate([current_action, obs])
+            action_obs_buffer = action_obs_buffer.at[-1, :].set(action_obs_combined_new)
+            
+            # 重置计数器为1
+            action_counter = 1
+        else:
+            # 使用上一个动作，计数器+1
+            action_counter += 1
         
-        # Print episode summary
-        mean_distance = np.mean(episode_data['distances'])
-        tracking_success_rate = np.mean(np.abs(np.array(episode_data['distances']) - 1.0) < 0.3) * 100
+        # ==================== Environment Step ====================
+        # 执行动作（current_action已经是归一化的，环境会处理）
+        transition = env.step(state, current_action, key)
+        state, obs, reward, terminated, truncated, info = transition
         
-        print(f"  ✓ Completed {episode_data['num_steps']} steps")
-        print(f"    Mean tracking distance: {mean_distance:.3f}m")
-        print(f"    Tracking success rate (±30cm): {tracking_success_rate:.1f}%")
-        print(f"    Terminated: {episode_data['terminated']}")
-        print()
+        # 记录数据
+        positions.append(np.array(state.quadrotor_state.p))
+        target_positions.append(np.array(state.target_pos))
+        velocities.append(np.array(state.quadrotor_state.v))
+        accelerations.append(np.array(state.quadrotor_state.acc))
+        actions_thrust.append(float(state.action_raw[0]))  # 使用归一化的原始输出 [-1, 1]
+        actions_omega.append(np.array(state.action_raw[1:]))  # 使用归一化的原始输出
+        rewards.append(float(reward))
+        distances.append(float(info['distance_to_target']))
+        times.append(float(state.time))
+        heights.append(float(state.quadrotor_state.p[2]))
+        
+        # 计算并记录目标与无人机x轴的夹角
+        angle = float(compute_angle_between_body_x_and_target(
+            state.quadrotor_state.R,
+            state.quadrotor_state.p,
+            state.target_pos
+        ))
+        angles_body_x_target.append(angle)
+        
+        # 打印进度
+        if (step + 1) % 100 == 0:
+            print(f"Step {step + 1}/{max_steps}, "
+                  f"Distance: {info['distance_to_target']:.3f}m, "
+                  f"Reward: {reward:.3f}, "
+                  f"Height: {state.quadrotor_state.p[2]:.3f}m")
+        
+        # 检查是否终止
+        if terminated or truncated:
+            print(f"\nSimulation terminated at step {step + 1}")
+            if terminated:
+                print("Reason: Distance exceeded reset threshold")
+            if truncated:
+                print("Reason: Max steps reached")
+            break
+        
+        # 更新key
+        key, _ = jax.random.split(key)
     
-    # ==================== Aggregate Statistics ====================
-    print(f"\n{'='*60}")
-    print(f"Test Results:")
-    print(f"{'='*60}\n")
+    # ==================== Data Processing ====================
+    positions = np.array(positions)
+    target_positions = np.array(target_positions)
+    velocities = np.array(velocities)
+    accelerations = np.array(accelerations)
+    actions_thrust = np.array(actions_thrust)
+    actions_omega = np.array(actions_omega)
+    rewards = np.array(rewards)
+    distances = np.array(distances)
+    times = np.array(times)
+    heights = np.array(heights)
+    angles_body_x_target = np.array(angles_body_x_target)
     
-    # Tracking performance
-    all_distances = np.concatenate([np.array(ep['distances']) for ep in all_episode_data])
-    mean_distance_all = np.mean(all_distances)
-    std_distance_all = np.std(all_distances)
-    tracking_success_rate_all = np.mean(np.abs(all_distances - 1.0) < 0.3) * 100
+    # ==================== Save Data ====================
+    output_data = {
+        'positions': positions,
+        'target_positions': target_positions,
+        'velocities': velocities,
+        'accelerations': accelerations,
+        'actions_thrust': actions_thrust,
+        'actions_omega': actions_omega,
+        'rewards': rewards,
+        'distances': distances,
+        'times': times,
+        'heights': heights,
+        'angles_body_x_target': angles_body_x_target,
+        'env_config': env_config,
+        'action_repeat': action_repeat,
+        'buffer_size': buffer_size,
+    }
     
-    print("📊 Tracking Performance:")
-    print(f"   • Mean distance to target: {mean_distance_all:.3f} ± {std_distance_all:.3f} m")
-    print(f"   • Success rate (±30cm from 1m): {tracking_success_rate_all:.1f}%")
-    print(f"   • Min distance: {np.min(all_distances):.3f} m")
-    print(f"   • Max distance: {np.max(all_distances):.3f} m")
-    
-    # Termination statistics
-    total_steps = sum(ep['num_steps'] for ep in all_episode_data)
-    num_terminated = sum(1 for ep in all_episode_data if ep['terminated'])
-    num_truncated = sum(1 for ep in all_episode_data if ep['truncated'])
-    
-    print(f"\n📈 Episode Statistics:")
-    print(f"   • Episode terminated early: {num_terminated} (tracking lost)")
-    print(f"   • Episode completed fully: {num_truncated} (reached max steps)")
-    print(f"   • Episode length: {total_steps} steps")
-    
-    # Overall assessment
-    print(f"\n{'='*60}")
-    print(f"Overall Assessment:")
-    print(f"{'='*60}")
-    
-    tracking_passed = tracking_success_rate_all >= 70  # 至少70%的时间在±30cm内
-    
-    print(f"✓ Tracking Test: {'PASSED ✅' if tracking_passed else 'FAILED ❌'}")
-    print(f"  (Success rate {tracking_success_rate_all:.1f}% {'≥' if tracking_passed else '<'} 70%)")
-    
-    if tracking_passed:
-        print(f"\n🎉 Tracking test PASSED! The policy successfully tracks the circular trajectory target.")
-    else:
-        print(f"\n⚠️  Tracking test FAILED. The policy needs further training or tuning.")
+    os.makedirs('aquila/output', exist_ok=True)
+    output_file = 'aquila/output/test_trackVer10_data.pkl'
+    with open(output_file, 'wb') as f:
+        pickle.dump(output_data, f)
+    print(f"\n✅ Test data saved to: {output_file}")
     
     # ==================== Visualization ====================
-    print(f"\n{'='*60}")
-    print(f"Generating visualizations...")
-    print(f"{'='*60}\n")
+    print("\nGenerating visualizations...")
     
-    # Create output directory
-    output_dir = 'aquila/output/trackVer10'
-    os.makedirs(output_dir, exist_ok=True)
+    # 图1: 3D轨迹图
+    fig1 = plt.figure(figsize=(12, 10))
+    ax1 = fig1.add_subplot(111, projection='3d')
     
-    # Visualize episode
-    print(f"Visualizing episode...")
-    save_path = f'{output_dir}/episode_1.png'
-    fig = visualize_episode(
-        all_episode_data[0], 
-        episode_idx=1,
-        save_path=save_path
-    )
-    plt.close(fig)
+    # 绘制无人机轨迹
+    ax1.plot(positions[:, 0], positions[:, 1], positions[:, 2], 
+             'b-', linewidth=2, label='Drone Trajectory', alpha=0.8)
     
-    # Create summary plot
-    print("Creating summary plot...")
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    # 绘制起点和终点
+    ax1.scatter(positions[0, 0], positions[0, 1], positions[0, 2], 
+                c='green', s=100, marker='o', label='Start Position')
+    ax1.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
+                c='red', s=100, marker='x', label='End Position')
     
-    # 1. Distance distribution
-    ax = axes[0, 0]
-    ax.hist(all_distances, bins=50, alpha=0.7, color='blue', edgecolor='black')
-    ax.axvline(x=1.0, color='r', linestyle='--', linewidth=2, label='Target (1m)')
-    ax.axvline(x=0.7, color='orange', linestyle=':', linewidth=2, label='Acceptable Range')
-    ax.axvline(x=1.3, color='orange', linestyle=':', linewidth=2)
-    ax.set_xlabel('Distance to Target [m]')
-    ax.set_ylabel('Frequency')
-    ax.set_title('Distribution of Tracking Distances')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    # 绘制目标轨迹
+    ax1.plot(target_positions[:, 0], target_positions[:, 1], target_positions[:, 2], 
+             'r--', linewidth=2, label='Target Position', alpha=0.6)
     
-    # 2. Tracking distance over time
-    ax = axes[0, 1]
-    distances = np.array(all_episode_data[0]['distances'])
-    ax.plot(distances, 'b-', linewidth=2, alpha=0.7)
-    ax.axhline(y=1.0, color='r', linestyle='--', linewidth=2, label='Target (1m)')
-    ax.axhline(y=1.3, color='orange', linestyle=':', linewidth=1, label='Acceptable Range')
-    ax.axhline(y=0.7, color='orange', linestyle=':', linewidth=1)
-    ax.set_xlabel('Step')
-    ax.set_ylabel('Distance to Target [m]')
-    ax.set_title('Tracking Distance Over Time')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    # 绘制目标初始位置
+    ax1.scatter(target_positions[0, 0], target_positions[0, 1], target_positions[0, 2], 
+                c='orange', s=100, marker='*', label='Target Start')
     
-    # 3. Reward over time
-    ax = axes[1, 0]
-    rewards = np.array(all_episode_data[0]['rewards'])
-    ax.plot(rewards, 'purple', linewidth=2, alpha=0.7)
-    ax.set_xlabel('Step')
-    ax.set_ylabel('Reward')
-    ax.set_title('Reward Over Time')
-    ax.grid(True, alpha=0.3)
+    # NED坐标系：z轴向下为正，需要翻转以便可视化
+    ax1.set_xlabel('X (North) [m]')
+    ax1.set_ylabel('Y (East) [m]')
+    ax1.set_zlabel('Z (Down) [m]')
+    ax1.set_title('TrackVer10: Drone Tracking Trajectory (3D)', fontsize=14, fontweight='bold')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
     
-    # 4. Target speed over time
-    ax = axes[1, 1]
-    target_velocities = np.array(all_episode_data[0].get('target_velocities', []))
-    if len(target_velocities) > 0:
-        target_speed = np.linalg.norm(target_velocities, axis=1)
-        ax.plot(target_speed, 'r-', linewidth=2, alpha=0.7, label='Target Speed')
-        ax.axhline(y=1.0, color='orange', linestyle='--', linewidth=1, label='Max Speed (1 m/s)')
-        ax.set_xlabel('Step')
-        ax.set_ylabel('Speed [m/s]')
-        ax.set_title('Target Speed Over Time')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(bottom=0)
+    # 设置相同的刻度范围
+    all_pos = np.vstack([positions, target_positions])
+    x_range = [all_pos[:, 0].min() - 0.5, all_pos[:, 0].max() + 0.5]
+    y_range = [all_pos[:, 1].min() - 0.5, all_pos[:, 1].max() + 0.5]
+    z_range = [all_pos[:, 2].min() - 0.5, all_pos[:, 2].max() + 0.5]
+    ax1.set_xlim(x_range)
+    ax1.set_ylim(y_range)
+    ax1.set_zlim(z_range)
     
     plt.tight_layout()
-    summary_path = f'{output_dir}/summary.png'
-    plt.savefig(summary_path, dpi=150, bbox_inches='tight')
-    print(f"  Summary plot saved to: {summary_path}")
-    plt.close(fig)
+    trajectory_file = 'aquila/output/trackVer10_trajectory_3d.png'
+    plt.savefig(trajectory_file, dpi=150, bbox_inches='tight')
+    print(f"✅ 3D trajectory plot saved to: {trajectory_file}")
+    plt.close()
     
-    print(f"\n✅ All visualizations saved to: {output_dir}/")
-    print(f"\nTest completed! 🎉")
+    # 图2: 数据分析图（动作、reward、高度、距离等）
+    fig2, axes = plt.subplots(4, 2, figsize=(14, 16))
+    
+    # 子图1: 推力动作（归一化原始输出）
+    axes[0, 0].plot(times, actions_thrust, 'b-', linewidth=1.5)
+    axes[0, 0].set_xlabel('Time [s]')
+    axes[0, 0].set_ylabel('Thrust (normalized)')
+    axes[0, 0].set_title('Thrust Command over Time (Normalized Output)')
+    axes[0, 0].set_ylim([-1.1, 1.1])
+    axes[0, 0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 子图2: 角速度动作（归一化原始输出）
+    axes[0, 1].plot(times, actions_omega[:, 0], 'r-', linewidth=1.5, label='ωx (Roll rate)')
+    axes[0, 1].plot(times, actions_omega[:, 1], 'g-', linewidth=1.5, label='ωy (Pitch rate)')
+    axes[0, 1].plot(times, actions_omega[:, 2], 'b-', linewidth=1.5, label='ωz (Yaw rate)')
+    axes[0, 1].set_xlabel('Time [s]')
+    axes[0, 1].set_ylabel('Angular Velocity (normalized)')
+    axes[0, 1].set_title('Angular Velocity Commands over Time (Normalized Output)')
+    axes[0, 1].set_ylim([-1.1, 1.1])
+    axes[0, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # 子图3: Reward
+    axes[1, 0].plot(times, rewards, 'purple', linewidth=1.5)
+    axes[1, 0].set_xlabel('Time [s]')
+    axes[1, 0].set_ylabel('Reward')
+    axes[1, 0].set_title('Reward over Time')
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    
+    # 子图4: 距离到目标
+    axes[1, 1].plot(times, distances, 'orange', linewidth=1.5)
+    axes[1, 1].set_xlabel('Time [s]')
+    axes[1, 1].set_ylabel('Distance [m]')
+    axes[1, 1].set_title('Distance to Target over Time')
+    axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5, label='Target distance (1m)')
+    axes[1, 1].legend()
+    
+    # 子图5: 高度（Z坐标，NED系）
+    axes[2, 0].plot(times, heights, 'brown', linewidth=1.5, label='Drone height')
+    axes[2, 0].plot(times, target_positions[:, 2], 'r--', linewidth=1.5, label='Target height')
+    axes[2, 0].set_xlabel('Time [s]')
+    axes[2, 0].set_ylabel('Z (Down) [m]')
+    axes[2, 0].set_title('Height (Z coordinate in NED) over Time')
+    axes[2, 0].legend()
+    axes[2, 0].grid(True, alpha=0.3)
+    
+    # 子图6: 速度模长
+    velocity_norm = np.linalg.norm(velocities, axis=1)
+    axes[2, 1].plot(times, velocity_norm, 'teal', linewidth=1.5)
+    axes[2, 1].set_xlabel('Time [s]')
+    axes[2, 1].set_ylabel('Velocity [m/s]')
+    axes[2, 1].set_title('Drone Velocity Magnitude over Time')
+    axes[2, 1].grid(True, alpha=0.3)
+    
+    # 子图7: 目标与无人机x轴的夹角
+    axes[3, 0].plot(times, angles_body_x_target, 'magenta', linewidth=1.5)
+    axes[3, 0].set_xlabel('Time [s]')
+    axes[3, 0].set_ylabel('Angle [degrees]')
+    axes[3, 0].set_title('Angle between Body X-axis and Target Direction')
+    axes[3, 0].grid(True, alpha=0.3)
+    axes[3, 0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[3, 0].axhline(y=90, color='r', linestyle='--', alpha=0.5, label='90° (perpendicular)')
+    axes[3, 0].axhline(y=180, color='r', linestyle='--', alpha=0.5, label='180° (opposite)')
+    axes[3, 0].legend()
+    axes[3, 0].set_ylim([0, 180])
+    
+    # 子图8: 留空或添加其他指标
+    axes[3, 1].axis('off')
+    
+    plt.tight_layout()
+    analysis_file = 'aquila/output/trackVer10_data_analysis.png'
+    plt.savefig(analysis_file, dpi=150, bbox_inches='tight')
+    print(f"✅ Data analysis plot saved to: {analysis_file}")
+    plt.close()
+    
+    # ==================== Summary Statistics ====================
+    print(f"\n{'='*60}")
+    print(f"Test Summary")
+    print(f"{'='*60}")
+    print(f"Total steps: {len(times)}")
+    print(f"Total time: {times[-1]:.2f}s")
+    print(f"Final distance to target: {distances[-1]:.3f}m")
+    print(f"Average distance to target: {np.mean(distances):.3f}m")
+    print(f"Min distance to target: {np.min(distances):.3f}m")
+    print(f"Average reward: {np.mean(rewards):.3f}")
+    print(f"Total reward: {np.sum(rewards):.3f}")
+    print(f"Final position: [{positions[-1, 0]:.3f}, {positions[-1, 1]:.3f}, {positions[-1, 2]:.3f}]")
+    print(f"Target position: [{target_positions[-1, 0]:.3f}, {target_positions[-1, 1]:.3f}, {target_positions[-1, 2]:.3f}]")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
-    main()
+    test_policy()
 
