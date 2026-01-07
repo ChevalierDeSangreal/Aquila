@@ -134,7 +134,7 @@ def test_policy():
     
     # ==================== Load Policy ====================
     # policy_file = 'aquila/param/trackVer8_policy_stabler.pkl'
-    policy_file = 'aquila/param/trackVer12_policy_stablerer.pkl'
+    policy_file = 'aquila/param/trackVer12_policy.pkl'
     params, env_config, action_repeat, buffer_size = load_trained_policy(policy_file)
     
     # ==================== Environment Setup ====================
@@ -207,32 +207,37 @@ def test_policy():
         dr_key=key
     )
     
-    # ==================== 星形轨迹参数 ====================
+    # ==================== 圆形轨迹参数 ====================
     # 无人机在原点 [0.0, 0.0, -2.0]，目标初始位置在正前方1m [1.0, 0.0, -2.0]
-    star_center = jnp.array([0.0, 0.0, -2.0])  # 星形中心位置（与无人机位置相同）
-    star_max_distance = 2.0  # 最大距离 (m)
-    star_acceleration = 0.5  # 加速度 (m/s²)
+    # 圆心位置调整，使得初始角度为0时，目标在正前方1m
+    circle_radius = 2.0  # 圆的半径 (m)
+    circle_speed = 1  # 圆周运动线速度 (m/s)
+    initial_angle = 0.0  # 固定初始角度为0，确保目标在正前方
+    circle_angle = initial_angle  # 当前角度（用于在循环中更新）
     
-    # 固定初始方向为x轴正方向（正前方）
-    star_direction = jnp.array([1.0, 0.0, 0.0])  # x轴正方向
+    # 计算圆心位置：目标在 [1.0, 0.0, -2.0]，半径3m，角度0
+    # 圆心 = 目标位置 - 半径 * (cos(0), sin(0), 0) = [1.0, 0.0, -2.0] - [3.0, 0.0, 0.0] = [-2.0, 0.0, -2.0]
+    circle_center = jnp.array([1.0 - circle_radius, 0.0, -2.0])  # 圆心位置，确保初始时目标在正前方1m
     
-    # 目标初始位置：正前方1m
-    target_pos = jnp.array([1.0, 0.0, -2.0])
-    target_vel = jnp.array([0.0, 0.0, 0.0])  # 初始速度为0
-    target_direction = star_direction
+    # 目标：圆形轨迹上的初始位置和速度（正前方1m）
+    target_pos = circle_center + jnp.array([
+        circle_radius * jnp.cos(initial_angle),
+        circle_radius * jnp.sin(initial_angle),
+        0.0
+    ])
+    target_vel = circle_speed * jnp.array([
+        -jnp.sin(initial_angle),
+        jnp.cos(initial_angle),
+        0.0
+    ])
+    target_direction = jnp.array([1.0, 0.0, 0.0])  # 不使用，但需要初始化
     
-    # 星形轨迹状态
-    # 目标已经在距离中心1m的位置，应该继续加速离开（phase 0）
-    star_phase = 0  # 0=加速离开, 1=减速到最远, 2=加速返回, 3=减速到中心
-    star_current_speed = 0.0  # 当前速度大小（从0开始加速）
-    
-    print(f"Star trajectory parameters:")
-    print(f"  Center: {star_center}")
-    print(f"  Max distance: {star_max_distance} m")
-    print(f"  Acceleration: {star_acceleration} m/s²")
-    print(f"  Initial direction: {star_direction}")
+    print(f"Circle trajectory parameters:")
+    print(f"  Center: {circle_center}")
+    print(f"  Radius: {circle_radius} m")
+    print(f"  Speed: {circle_speed} m/s")
+    print(f"  Initial angle: {initial_angle:.3f} rad")
     print(f"  Initial target position: {target_pos} (should be [1.0, 0.0, -2.0])")
-    print(f"  Initial distance from center: {jnp.linalg.norm(target_pos - star_center):.3f} m")
     
     # 计算悬停动作（使用随机化后的参数）
     thrust_hover = quad_params.mass * quad_params.gravity
@@ -253,7 +258,7 @@ def test_policy():
         target_vel=target_vel,
         target_direction=target_direction,
         quad_params=quad_params,
-        target_speed_max=0.0,  # 星形轨迹不使用此参数
+        target_speed_max=circle_speed,  # 圆形轨迹速度
         action_raw=jnp.zeros(4),
         filtered_acc=jnp.array([0.0, 0.0, 9.81]),
         filtered_thrust=jnp.array(thrust_hover),
@@ -310,50 +315,28 @@ def test_policy():
     angles_body_x_target = []  # 目标与无人机x轴的夹角
     
     for step in range(max_steps):
-        # ==================== 更新星形轨迹 ====================
+        # ==================== 更新圆形轨迹（测试代码维护）====================
         dt = env.unwrapped.dt
-        distance_to_center = jnp.linalg.norm(target_pos - star_center)
+        angular_velocity = circle_speed / circle_radius
+        circle_angle = circle_angle + angular_velocity * dt
         
-        # 根据阶段更新速度和位置
-        if star_phase == 0:  # 加速离开
-            star_current_speed = star_current_speed + star_acceleration * dt
-            remaining_distance = star_max_distance - distance_to_center
-            decel_distance = (star_current_speed ** 2) / (2 * star_acceleration)
-            if decel_distance >= remaining_distance:
-                star_phase = 1  # 切换到减速阶段
-                
-        elif star_phase == 1:  # 减速到最远
-            star_current_speed = jnp.maximum(star_current_speed - star_acceleration * dt, 0.0)
-            if distance_to_center >= star_max_distance or star_current_speed <= 1e-6:
-                star_phase = 2  # 切换到返回加速阶段
-                
-        elif star_phase == 2:  # 加速返回
-            star_current_speed = star_current_speed + star_acceleration * dt
-            decel_distance = (star_current_speed ** 2) / (2 * star_acceleration)
-            if decel_distance >= distance_to_center:
-                star_phase = 3  # 切换到返回减速阶段
-                
-        else:  # star_phase == 3: 减速到中心
-            star_current_speed = jnp.maximum(star_current_speed - star_acceleration * dt, 0.0)
-            if distance_to_center <= 0.1:  # 10cm以内算到达中心
-                # 随机生成新的水平方向并重新开始
-                key, _ = jax.random.split(key)  # 更新key用于生成新方向
-                new_angle = jax.random.uniform(key, shape=(), minval=0.0, maxval=2.0 * jnp.pi)
-                star_direction = jnp.array([jnp.cos(new_angle), jnp.sin(new_angle), 0.0])
-                star_current_speed = 0.0
-                star_phase = 0
-        
-        # 计算速度方向（phase 0和1向外，phase 2和3向内）
-        direction_multiplier = 1.0 if (star_phase == 0 or star_phase == 1) else -1.0
-        target_vel = star_current_speed * direction_multiplier * star_direction
-        target_pos = target_pos + target_vel * dt
+        # 更新目标位置和速度
+        target_pos = circle_center + jnp.array([
+            circle_radius * jnp.cos(circle_angle),
+            circle_radius * jnp.sin(circle_angle),
+            0.0
+        ])
+        target_vel = circle_speed * jnp.array([
+            -jnp.sin(circle_angle),
+            jnp.cos(circle_angle),
+            0.0
+        ])
         
         # 更新state中的目标位置和速度
         state = dataclasses.replace(
             state,
             target_pos=target_pos,
             target_vel=target_vel,
-            target_direction=star_direction,
         )
         
         # ==================== 动作选择（与训练时完全一致）====================

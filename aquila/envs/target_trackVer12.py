@@ -604,9 +604,9 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         action_thrust = 0.5 * (thrust_normalized + 1.0) * (actual_thrust_max * 4 - self.thrust_min * 4) + self.thrust_min * 4
         # 计算悬停推力：mass * gravity
         thrust_hover = next_state.quad_params.mass * next_state.quad_params.gravity
-        # 计算推力偏差的L2范数（对于标量，L2范数就是绝对差值）
-        thrust_error = action_thrust - thrust_hover
-        thrust_loss = safe_norm(jnp.array([thrust_error]), eps=1e-8)
+        # 计算推力偏差的绝对值，然后使用指数增长
+        thrust_error = jnp.abs(action_thrust - thrust_hover)
+        thrust_loss = jnp.exp(thrust_error) - 1.0  # 指数增长
         
         # 总损失 - 根据新的损失函数特性调整权重
         # 权重调整说明：
@@ -623,7 +623,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
             3 * velocity_loss +         # 速度损失：零惩罚范围后线性增长，权重提高
             40 * direction_loss +       # 方向损失：零惩罚范围后指数增长，权重稍微降低
             80 * height_loss +          # 高度损失：零惩罚范围后线性增长，保持较高权重
-            0.4 * action_loss +           # 动作损失：指数增长，权重降低
+            4 * action_loss +           # 动作损失：指数增长，权重降低
             1 * omega_loss +            # 角速度损失：指数增长，权重降低
             0.4 * thrust_loss            # 推力超限损失：中等权重，约束推力接近悬停推力（Ver10新增，Ver12继承）
         )

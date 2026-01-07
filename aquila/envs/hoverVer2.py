@@ -533,7 +533,7 @@ class HoverEnvVer2(env_base.Env[HoverStateVer2]):
             5 * velocity_loss +       # 速度损失：高权重
             10 * ori_loss +           # 姿态损失：中等权重
             80 * action_loss +          # 动作损失：低权重
-            80 * omega_loss +           # 角速度损失：低权重
+            10 * omega_loss +           # 角速度损失：低权重
             50 * thrust_loss            # 推力超限损失：中等权重
         )
         
