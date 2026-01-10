@@ -3,16 +3,19 @@
 
 """
 Crazyflie实机测试脚本 - 位置控制悬停
-使用OptiTrack提供位置，Crazyflie自带API控制悬停
+使用NatNetClient（OptiTrack SDK）提供位置，Crazyflie自带API控制悬停
 
 流程：
 1. 连接Crazyflie
-2. 使用位置控制模式起飞到0.5m高度
-3. 使用位置控制API悬停在当前点
-4. 结束控制并降落
+2. 连接OptiTrack Motive（通过NatNetClient）
+3. 使用位置控制模式起飞到0.5m高度
+4. 使用位置控制API悬停在当前点
+5. 结束控制并降落
 
 坐标系说明：
-- Crazyflie/OptiTrack：ENU (East-North-Up)
+- OptiTrack/Motive默认：右手坐标系 (X-right, Y-up, Z-forward)
+- Crazyflie期望：ENU (East-North-Up)
+- 坐标转换：ENU_x=X, ENU_y=Z, ENU_z=Y
 """
 
 import os
@@ -33,11 +36,11 @@ except ImportError:
     print("❌ 错误：未找到cflib库，请安装：pip install cflib")
     sys.exit(1)
 
-# ==================== 导入OptiTrack库 ====================
+# ==================== 导入NatNetClient库 ====================
 try:
-    from natnetclient import NatClient
+    from NatNetClient import NatNetClient
 except ImportError:
-    print("❌ 错误：未找到natnetclient库，请安装：pip install natnetclient")
+    print("❌ 错误：未找到NatNetClient库，请从OptiTrack官网下载NatNet SDK")
     sys.exit(1)
 
 # ==================== 配置 ====================
@@ -54,19 +57,20 @@ dt = 1.0 / CONTROL_FREQ  # 控制周期 (s)
 TAKEOFF_VELOCITY = 0.3  # 起飞速度 (m/s)
 LAND_VELOCITY = 0.3  # 降落速度 (m/s)
 
-# OptiTrack配置
-OPTITRACK_SERVER_IP = "192.168.1.1"  # OptiTrack服务器IP，请根据实际情况修改
-OPTITRACK_LOCAL_IP = "192.168.1.100"  # 本地IP，请根据实际情况修改
-OPTITRACK_RIGID_BODY_ID = 1  # 刚体ID，请根据实际情况修改
+# OptiTrack NatNet配置
+OPTITRACK_SERVER_IP = "192.168.1.100"     # OptiTrack服务器IP（运行Motive的主机）
+OPTITRACK_CLIENT_IP = "192.168.1.101"     # 本机IP（运行此脚本的主机）
+OPTITRACK_RIGID_BODY_ID = 1               # 刚体ID（在Motive中定义的Rigid Body ID）
+OPTITRACK_USE_MULTICAST = True            # 是否使用多播模式
 
 # 日志配置
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 
-# ==================== OptiTrack客户端 ====================
+# ==================== OptiTrack NatNet客户端 ====================
 class OptiTrackReceiver:
-    """OptiTrack位置数据接收器（仅接收位置，姿态从Crazyflie获取）"""
+    """OptiTrack NatNet位置数据接收器（仅接收位置，姿态从Crazyflie获取）"""
     
     def __init__(self, state_manager, crazyflie=None):
         """
@@ -77,45 +81,62 @@ class OptiTrackReceiver:
         self.state_manager = state_manager
         self.cf = crazyflie
         self.running = False
-        self.thread = None
         self.lock = threading.Lock()
         
         # 最新位置数据
         self.latest_position = None
         self.latest_timestamp = None
         
-        # 初始化NatNet客户端
+        # 初始化NatNetClient
         try:
-            self.natnet_client = NatClient(OPTITRACK_SERVER_IP)
+            self.natnet_client = NatNetClient()
+            self.natnet_client.set_client_address(OPTITRACK_CLIENT_IP)
+            self.natnet_client.set_server_address(OPTITRACK_SERVER_IP)
+            self.natnet_client.set_use_multicast(OPTITRACK_USE_MULTICAST)
+            
+            # 注册刚体数据回调
+            self.natnet_client.rigid_body_listener = self._on_rigid_body_data
+            
+            logger.info(f"✅ NatNetClient已配置: Server={OPTITRACK_SERVER_IP}, Client={OPTITRACK_CLIENT_IP}")
         except Exception as e:
             self.natnet_client = None
-            logger.error(f"❌ 无法初始化OptiTrack客户端: {e}")
+            logger.error(f"❌ 无法初始化NatNetClient: {e}")
     
-    def _receive_loop(self):
-        """接收循环：从OptiTrack获取位置数据"""
+    def _on_rigid_body_data(self, rigid_body_id, position, rotation):
+        """NatNetClient回调：接收刚体数据并更新位置
+        
+        Args:
+            rigid_body_id: 刚体ID
+            position: 位置元组 (x, y, z)，OptiTrack坐标系
+            rotation: 四元数元组 (qx, qy, qz, qw)，不使用
+        """
         try:
-            while self.running:
-                # 获取刚体数据
-                rigid_body = self.natnet_client.rigid_bodies.get(OPTITRACK_RIGID_BODY_ID)
-                if rigid_body is not None:
-                    # 只获取位置（ENU坐标系），不获取姿态
-                    pos = rigid_body.position
-                    x, y, z = pos[0], pos[1], pos[2]
-                    
-                    with self.lock:
-                        self.latest_position = np.array([x, y, z])
-                        self.latest_timestamp = time.time()
-                    
-                    # 更新状态管理器（只更新位置）
-                    self.state_manager.update_position(x, y, z)
-                    
-                    # 发送位置给Crazyflie（通过外部定位系统）
-                    if self.cf is not None:
-                        self._send_position_to_crazyflie(x, y, z)
-                
-                time.sleep(0.01)  # 100Hz
+            # 只处理我们关注的刚体
+            if rigid_body_id != OPTITRACK_RIGID_BODY_ID:
+                return
+            
+            # OptiTrack坐标系转换到ENU
+            # OptiTrack: X-right, Y-up, Z-forward
+            # ENU: X-east, Y-north, Z-up
+            # 转换: ENU_x = Opti_x, ENU_y = Opti_z, ENU_z = Opti_y
+            x_enu = float(position[0])
+            y_enu = float(position[2])
+            z_enu = float(position[1])
+            
+            with self.lock:
+                self.latest_position = np.array([x_enu, y_enu, z_enu])
+                self.latest_timestamp = time.time()
+            
+            # 更新状态管理器（只更新位置）
+            self.state_manager.update_position(x_enu, y_enu, z_enu)
+            
+            # 发送位置给Crazyflie（通过外部定位系统）
+            if self.cf is not None:
+                self._send_position_to_crazyflie(x_enu, y_enu, z_enu)
         except Exception as e:
-            logger.error(f"OptiTrack接收循环错误: {e}")
+            if logger.level <= logging.DEBUG:
+                logger.warning(f"处理OptiTrack刚体数据失败: {e}")
+    
     
     def _send_position_to_crazyflie(self, x, y, z):
         """将位置数据发送给Crazyflie外部定位系统（仅位置，不含姿态）"""
@@ -126,7 +147,6 @@ class OptiTrackReceiver:
             # 通过extpos接口发送位置（仅位置，姿态由Crazyflie自己估计）
             if hasattr(self.cf, 'extpos'):
                 # 发送位置（ENU坐标系，单位：米）
-                # 注意：某些extpos接口可能需要姿态，但我们可以只发送位置
                 try:
                     self.cf.extpos.send_extpos(x, y, z)
                 except TypeError:
@@ -140,23 +160,29 @@ class OptiTrackReceiver:
                 logger.warning(f"发送位置到Crazyflie失败: {e}")
     
     def start(self):
-        """启动OptiTrack接收线程"""
+        """启动NatNetClient"""
         if self.natnet_client is None:
-            logger.error("❌ OptiTrack客户端不可用，无法启动")
+            logger.error("❌ NatNetClient不可用，无法启动")
             return False
         
-        self.running = True
-        self.thread = threading.Thread(target=self._receive_loop, daemon=True)
-        self.thread.start()
-        logger.info("✅ OptiTrack接收线程已启动")
-        return True
+        try:
+            self.natnet_client.run()
+            self.running = True
+            logger.info("✅ NatNetClient已启动")
+            return True
+        except Exception as e:
+            logger.error(f"❌ 启动NatNetClient失败: {e}")
+            return False
     
     def stop(self):
-        """停止OptiTrack接收线程"""
-        self.running = False
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
-        logger.info("✅ OptiTrack接收线程已停止")
+        """停止NatNetClient"""
+        if self.natnet_client is not None:
+            try:
+                self.natnet_client.shutdown()
+                self.running = False
+                logger.info("✅ NatNetClient已停止")
+            except Exception as e:
+                logger.warning(f"停止NatNetClient时出错: {e}")
     
     def get_latest_position(self):
         """获取最新位置"""
@@ -256,7 +282,7 @@ def setup_logging(scf, state_manager):
     """设置Crazyflie日志回调
     
     注意：
-    - 位置数据从OptiTrack直接获取（通过OptiTrackReceiver）
+    - 位置数据从OptiTrack NatNet直接获取（通过OptiTrackReceiver）
     - 姿态数据从Crazyflie日志获取（stateEstimate.qx/qy/qz/qw）
     - 角速度数据从Crazyflie日志获取（gyro.x/y/z）
     """
@@ -552,7 +578,7 @@ def main():
             logger.info(f"\n连接OptiTrack服务器: {OPTITRACK_SERVER_IP}")
             optitrack_receiver = OptiTrackReceiver(state_manager, crazyflie=scf.cf)
             
-            # 启动OptiTrack接收线程
+            # 启动OptiTrack接收
             if not optitrack_receiver.start():
                 logger.error("❌ 无法启动OptiTrack接收器，请检查配置")
                 return
@@ -561,13 +587,13 @@ def main():
             log_configs = setup_logging(scf, state_manager)
             
             # 等待OptiTrack数据准备好
-            logger.info("等待OptiTrack数据...")
+            logger.info("等待OptiTrack位置数据...")
             time.sleep(2.0)
             
             if not state_manager.data_ready:
-                logger.error("❌ 未收到OptiTrack数据，请检查配置")
+                logger.error("❌ 未收到OptiTrack位置数据，请检查配置")
                 logger.error(f"   服务器IP: {OPTITRACK_SERVER_IP}")
-                logger.error(f"   本地IP: {OPTITRACK_LOCAL_IP}")
+                logger.error(f"   客户端IP: {OPTITRACK_CLIENT_IP}")
                 logger.error(f"   刚体ID: {OPTITRACK_RIGID_BODY_ID}")
                 optitrack_receiver.stop()
                 return
