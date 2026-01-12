@@ -1,0 +1,37 @@
+# Crazyswarm配置文件 - Crazyflie定义
+# 此文件定义系统中所有的Crazyflie无人机
+
+crazyflies:
+  # 第一架Crazyflie
+  - id: 1                           # 无人机ID（必须唯一）
+    channel: 80                     # 无线电频道
+    initialPosition: [0.0, 0.0, 0.0]  # 初始位置 [x, y, z] in ENU (米)
+    type: default                   # 无人机类型
+
+  # 如果有多架无人机，继续添加：
+  # - id: 2
+  #   channel: 100
+  #   initialPosition: [0.5, 0.0, 0.0]
+  #   type: default
+  
+  # - id: 3
+  #   channel: 120
+  #   initialPosition: [0.0, 0.5, 0.0]
+  #   type: default
+
+# 无人机类型定义
+all:
+  # 固件类型
+  firmware: stock  # 使用标准固件（或 "custom" 表示自定义固件）
+  
+  # PID控制器参数（可选，使用默认值即可）
+  # pid:
+  #   xy:
+  #     kp: 0.4
+  #     kd: 0.2
+  #     ki: 0.05
+  #   z:
+  #     kp: 1.25
+  #     kd: 0.4
+  #     ki: 0.05
+

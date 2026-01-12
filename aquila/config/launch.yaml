@@ -1,0 +1,58 @@
+# Crazyswarm启动配置文件
+# 此文件配置定位系统、通信参数等
+
+# ==================== 定位系统配置 ====================
+# 支持的类型: "optitrack", "vicon", "qualisys", "none"
+motion_capture_type: "optitrack"
+
+# OptiTrack配置
+optitrack:
+  server_ip: "192.168.1.100"    # 运行Motive的主机IP地址
+  local_ip: "192.168.1.101"     # 本机IP地址（运行Crazyswarm的主机）
+  use_multicast: true           # 是否使用多播模式
+
+# Vicon配置（如果使用Vicon系统）
+# vicon:
+#   hostname: "192.168.1.100"
+
+# Qualisys配置（如果使用Qualisys系统）
+# qualisys:
+#   hostname: "192.168.1.100"
+#   base_port: 22222
+
+# ==================== Crazyflie配置 ====================
+all:
+  # 固件类型
+  firmware: stock  # "stock" 或 "custom"
+  
+  # 最大速度限制 (m/s)
+  maxVelocity: 2.0
+  
+  # 最大角速度限制 (度/s)
+  maxYawRate: 180.0
+
+# ==================== 坐标系配置 ====================
+# Crazyswarm使用ENU坐标系 (East-North-Up)
+# x: East (东)
+# y: North (北)
+# z: Up (上)
+coordinate_system: enu
+
+# ==================== 无线电配置 ====================
+radio:
+  address: 0xE7E7E7E701  # Crazyflie无线电地址（默认值）
+  data_rate: 2M          # 数据速率: 250K, 1M, 2M
+
+# ==================== 日志配置 ====================
+logging:
+  # 是否启用详细日志
+  verbose: false
+  
+  # 日志级别: DEBUG, INFO, WARNING, ERROR
+  level: INFO
+
+# ==================== 性能配置 ====================
+# 更新频率 (Hz)
+# Crazyswarm推荐30Hz用于稳定控制
+update_rate: 30
+
