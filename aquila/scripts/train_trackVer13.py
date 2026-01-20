@@ -21,18 +21,19 @@ import pickle
 from torch.utils.tensorboard import SummaryWriter
 
 # Add parent directory to path for imports
-# aquila/scripts/train_trackVer12.py -> ../../ -> Aquila project root
+# aquila/scripts/train_trackVer13.py -> ../../ -> Aquila project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.target_trackVer12 import TrackEnvVer12  # 使用TrackEnvVer12（基于Ver10，测试更激进reward的版本）
+from aquila.envs.target_trackVer13 import TrackEnvVer13  # 使用TrackEnvVer13（基于Ver12，使用更激进的权重和目标加速度随机化）
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
 from aquila.algos import bptt
 
 """
-TrackVer12: 基于Ver10，类似HoverVer2，训练50Hz运行的网络
+TrackVer13: 基于Ver12，使用更激进的权重和目标加速度随机化，训练50Hz运行的网络
 - action_repeat = 2 (每2个step才获取一次新动作，每秒50次动作，每次持续0.02秒)
 - buffer_size = 50 (动作-状态缓冲区大小)
+- target_acceleration_max: 目标最大加速度，每次reset时在0到此值之间随机生成实际加速度
 """
 
 
@@ -68,8 +69,8 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Environment Setup ====================
-    # Create env - 使用TrackEnvVer12环境（基于Ver10，测试更激进reward的版本），训练50Hz网络
-    env = TrackEnvVer12(
+    # Create env - 使用TrackEnvVer13环境（基于Ver12，使用更激进的权重和目标加速度随机化），训练50Hz网络
+    env = TrackEnvVer13(
         max_steps_in_episode=1000,  # 追踪任务的最大步数
         dt=0.01,  # 使用完整四旋翼的默认时间步长
         delay=0.03,  # 可选执行延迟
@@ -79,7 +80,8 @@ def main():
         target_height=2.0,  # m (高度2米，实际会在(-2.2, -1.8)范围内随机)
         target_init_distance_min=0.5,  # m (x轴上的初始距离最小值)
         target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
-        target_speed_max=6.0,  # m/s (目标最大速度上限，实际每episode会在0-2之间随机)
+        target_speed_max=8.0,  # m/s (目标最大速度上限，实际每episode会在0-1之间随机)
+        target_acceleration_max=8,  # m/s² (目标最大加速度，每次reset时在0到此值之间随机生成实际加速度)
         reset_distance=100.0,  # m (重置距离阈值)
         max_speed=20.0,  # m/s
         # Parameter randomization (quadrotor)
@@ -144,7 +146,7 @@ def main():
         print("✅ 使用初始网络参数开始训练")
     else:
         # 使用加载的参数
-        policy_file = 'aquila/param/trackVer12_policy.pkl'  # 使用Ver12的模型文件
+        policy_file = 'aquila/param/trackVer13_policy.pkl'  # 使用Ver13的模型文件
         loaded_params, env_config = load_trained_policy(policy_file)
         train_state = TrainState.create(
             apply_fn=policy.apply,
@@ -155,7 +157,7 @@ def main():
     
     # ==================== TensorBoard Setup ====================
     # 创建tensorboard日志目录
-    log_dir = f'runs/trackVer12_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用Ver12的日志目录
+    log_dir = f'runs/trackVer13_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用Ver13的日志目录
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard logs will be saved to: {log_dir}")
     print(f"Run 'tensorboard --logdir=runs' to view training progress")
@@ -168,7 +170,7 @@ def main():
     training_log = []
     
     print(f"\n{'='*60}")
-    print(f"开始训练追踪任务 (TrackVer12 - 基于Ver10，训练50Hz运行的网络)...")
+    print(f"开始训练追踪任务 (TrackVer13 - 基于Ver12，使用更激进的权重和目标加速度随机化，训练50Hz运行的网络)...")
     print(f"Total environments: {num_envs}")
     print(f"Number of epochs: {num_epochs}")
     print(f"Steps per epoch: {env.max_steps_in_episode}")
@@ -240,7 +242,7 @@ def main():
     
     # ==================== Print Summary ====================
     print(f"\n{'='*60}")
-    print(f"追踪任务训练完成！(TrackVer12 - 基于Ver10，训练50Hz运行的网络)")
+    print(f"追踪任务训练完成！(TrackVer13 - 基于Ver12，使用更激进的权重和目标加速度随机化，训练50Hz运行的网络)")
     print(f"{'='*60}")
     print(f"Training time: {training_time:.2f} seconds ({training_time/60:.2f} minutes)")
     print(f"Final Loss: {final_loss:.6f}")
@@ -270,11 +272,12 @@ def main():
             'dt': env.dt,
             'delay': env.delay,
             'action_penalty_weight': env.action_penalty_weight,
-            # Ver12 基于Ver10，测试更激进reward的版本，训练50Hz运行的网络：目标位置y和z随机，roll/pitch±30°随机，yaw完全随机，初始速度0-0.5m/s随机方向，目标速度每episode随机，奖励中加入推力惩罚
+            # Ver13 基于Ver12，使用更激进的权重和目标加速度随机化，训练50Hz运行的网络：目标位置y和z随机，roll/pitch±30°随机，yaw完全随机，初始速度0-0.5m/s随机方向，目标速度每episode随机，目标加速度每episode随机（0到最大加速度之间），奖励中加入推力惩罚
             'target_height': env.target_height,
             'target_init_distance_min': env.target_init_distance_min,
             'target_init_distance_max': env.target_init_distance_max,
             'target_speed_max': env.target_speed_max,
+            'target_acceleration_max': env.target_acceleration_max,
             'reset_distance': env.reset_distance,
             'max_speed': env.max_speed,
         }
@@ -284,14 +287,14 @@ def main():
     os.makedirs('aquila/param', exist_ok=True)
     
     # 保存为pickle文件
-    checkpoint_path = 'aquila/param/trackVer12_policy.pkl'  # 使用Ver12的文件名
+    checkpoint_path = 'aquila/param/trackVer13_policy.pkl'  # 使用Ver13的文件名
     with open(checkpoint_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"\n✅ Trained tracking policy saved as: {checkpoint_path}")
     
     # 额外保存一个带时间戳的备份
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = f'aquila/param/trackVer12_policy_{timestamp}.pkl'  # 使用Ver12的文件名
+    backup_path = f'aquila/param/trackVer13_policy_{timestamp}.pkl'  # 使用Ver13的文件名
     with open(backup_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"✅ Backup saved as: {backup_path}")

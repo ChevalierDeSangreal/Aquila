@@ -1,13 +1,15 @@
 """
-Track Environment Version 12
+Track Environment Version 13
 Full quadrotor tracking environment with a moving target.
-Ver12 modifications: Based on Ver10, used for testing more aggressive reward functions.
-The main difference from Ver10 is the reward function - Ver12 uses more aggressive reward weights
-to test different training dynamics.
+Ver13 modifications: Based on Ver12, used for testing more aggressive reward weights and target acceleration randomization.
+The main differences from Ver12:
+- Uses more aggressive reward weights for testing different training dynamics
+- Target acceleration is randomized per episode (0 to max acceleration) instead of fixed
 
-Ver10 features (inherited):
+Ver12 features (inherited):
 - Target initial position: randomized in x, y (±0.2m), and z (-2.2 to -1.8m)
 - Target max speed: randomized from 0 to 1 m/s per episode
+- Target acceleration: randomized from 0 to max acceleration per episode (Ver13 new)
 - Drone initial orientation: roll and pitch randomized within ±30°, yaw fully randomized
 - Drone initial velocity: random direction, magnitude in [0, 0.5] m/s
 - Removed observation delay - uses true state values directly
@@ -47,7 +49,7 @@ class ExtendedQuadrotorParams(QuadrotorParams):
 
 
 @jdc.pytree_dataclass
-class TrackStateVer12:
+class TrackStateVer13:
     time: float
     step_idx: int
     quadrotor_state: QuadrotorState
@@ -57,6 +59,7 @@ class TrackStateVer12:
     target_direction: jax.Array  # 目标速度方向（单位向量，用于随机方向运动）
     quad_params: ExtendedQuadrotorParams  # 添加quadrotor参数（扩展版，包含mass和gravity）
     target_speed_max: float = 1.0  # 当前episode的目标最大速度（每次reset随机化）
+    target_acceleration: float = 0.5  # 当前episode的目标加速度（每次reset随机化，0到最大加速度之间）
     action_raw: jax.Array = field_jnp(jnp.zeros(4))
     filtered_acc: jax.Array = field_jnp([0.0, 0.0, 9.8])
     filtered_thrust: float = field_jnp(9.8)
@@ -87,8 +90,8 @@ def safe_norm(x, eps=1e-8):
     return jnp.sqrt(jnp.sum(x * x) + eps)
 
 
-class TrackEnvVer12(env_base.Env[TrackStateVer12]):
-    """Quadrotor tracking environment Ver12 - based on Ver10, used for testing more aggressive reward functions."""
+class TrackEnvVer13(env_base.Env[TrackStateVer13]):
+    """Quadrotor tracking environment Ver13 - based on Ver12, used for testing more aggressive reward weights and target acceleration randomization."""
     
     def __init__(
         self,
@@ -104,7 +107,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         target_init_distance_min=0.5,  # m (x轴上的初始距离最小值)
         target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
         target_speed_max=1.0,  # m/s (目标最大速度)
-        target_acceleration=0.5,  # m/s² (目标加速度，从0加速到最大速度)
+        target_acceleration_max=0.5,  # m/s² (目标最大加速度，每次reset时在0到此值之间随机生成实际加速度)
         reset_distance=100.0,  # m (重置距离阈值)
         max_speed=20.0,  # m/s
         # Parameter randomization (quadrotor)
@@ -152,7 +155,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         self.target_init_distance_min = target_init_distance_min
         self.target_init_distance_max = target_init_distance_max
         self.target_speed_max = target_speed_max
-        self.target_acceleration = target_acceleration
+        self.target_acceleration_max = target_acceleration_max
         self.reset_distance = reset_distance
         
         # Parameter randomization
@@ -161,7 +164,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         self.disturbance_mag = disturbance_mag
 
     def reset(
-        self, key: chex.PRNGKey, state: Optional[TrackStateVer12] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
+        self, key: chex.PRNGKey, state: Optional[TrackStateVer13] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
         """Reset environment with tracking-specific initialization.
         
         Args:
@@ -173,8 +176,8 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
             return state, self._get_obs(state)
         
         # 分割随机数key
-        keys = jax.random.split(key, 13)
-        key_target_x, key_target_y, key_target_z, key_target_dir, key_target_speed, key_roll, key_pitch, key_yaw, key_omega, key_quad, key_randomize, key_vel_dir, key_vel_mag = keys
+        keys = jax.random.split(key, 14)
+        key_target_x, key_target_y, key_target_z, key_target_dir, key_target_speed, key_target_acc, key_roll, key_pitch, key_yaw, key_omega, key_quad, key_randomize, key_vel_dir, key_vel_mag = keys
         
         # 获取quadrotor参数（如果没有提供则使用默认参数）
         if quad_params is None:
@@ -232,6 +235,13 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
             key_target_speed, shape=(),
             minval=0.0,
             maxval=1.0
+        )
+        
+        # 每次episode随机化目标加速度（0到最大加速度之间）
+        episode_target_acceleration = jax.random.uniform(
+            key_target_acc, shape=(),
+            minval=0.0,
+            maxval=self.target_acceleration_max
         )
         
         # 初始速度为0，将加速到episode的目标最大速度（沿随机方向）
@@ -297,7 +307,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         filtered_acc = jax.device_put(jnp.array([0.0, 0.0, 9.81]))  # NED坐标系，Down为正
         filtered_thrust = jax.device_put(jnp.array(thrust_hover))
 
-        state = TrackStateVer12(
+        state = TrackStateVer13(
             time=0.0,
             step_idx=0,
             quadrotor_state=quadrotor_state,
@@ -307,6 +317,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
             target_direction=target_direction,
             quad_params=quad_params,
             target_speed_max=episode_target_speed_max,
+            target_acceleration=episode_target_acceleration,
             action_raw=action_raw,
             filtered_acc=filtered_acc,
             filtered_thrust=filtered_thrust,
@@ -315,10 +326,10 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         
         return state, self._get_obs(state)
 
-    def _get_obs(self, state: TrackStateVer12) -> jax.Array:
+    def _get_obs(self, state: TrackStateVer13) -> jax.Array:
         """Get observation from state.
         
-        Ver12修改：继承Ver10，移除观测延迟，直接使用真实状态值
+        Ver13修改：继承Ver12，移除观测延迟，直接使用真实状态值
         
         观测组成：
         1. 无人机机体系自身速度向量 (3)
@@ -354,7 +365,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _step(
-        self, state: TrackStateVer12, action: jax.Array, key: chex.PRNGKey
+        self, state: TrackStateVer13, action: jax.Array, key: chex.PRNGKey
     ) -> EnvTransition:
         # 保存原始action (tanh输出为[-1,1]范围)
         action_raw = action
@@ -431,11 +442,11 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         current_speed_vec = state.target_vel
         current_speed = safe_norm(current_speed_vec, eps=1e-8)
         episode_target_speed_max = state.target_speed_max  # 使用当前episode的目标最大速度
-        target_acc = self.target_acceleration
+        episode_target_acceleration = state.target_acceleration  # 使用当前episode的目标加速度（随机生成）
         
         # 如果当前速度小于最大速度，则加速
         new_speed = jnp.minimum(
-            current_speed + target_acc * self.dt,
+            current_speed + episode_target_acceleration * self.dt,
             episode_target_speed_max
         )
         # 速度向量 = 速度大小 * 方向单位向量
@@ -454,6 +465,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
             last_actions=last_actions,
             quad_params=state.quad_params,  # 保持quad_params不变
             target_speed_max=state.target_speed_max,  # 保持target_speed_max不变
+            target_acceleration=state.target_acceleration,  # 保持target_acceleration不变
             action_raw=action_raw,
             filtered_acc=filtered_acc,
             filtered_thrust=filtered_thrust,
@@ -490,9 +502,9 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         )
 
     def _compute_reward(
-        self, last_state: TrackStateVer12, next_state: TrackStateVer12
+        self, last_state: TrackStateVer13, next_state: TrackStateVer13
     ) -> jax.Array:
-        """计算奖励 - 基于Ver10，使用更激进的奖励权重进行测试
+        """计算奖励 - 基于Ver12，使用更激进的奖励权重进行测试
         奖励设计：
         1. 方向损失：使用余弦相似度计算完整3D方向
         2. 距离损失：水平距离与目标距离的绝对差值
@@ -503,7 +515,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         7. 角速度损失：惩罚旋转运动（防止roll持续旋转）
         8. 推力超限损失：动作推力与悬停推力的偏差（Ver10新增）
         
-        Ver12与Ver10的区别：使用更激进的奖励权重进行测试
+        Ver13与Ver12的区别：使用更激进的奖励权重进行测试
         """
         # 获取状态信息
         quad_pos = next_state.quadrotor_state.p
@@ -616,16 +628,16 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
         # - 姿态损失：改为指数增长，权重降低到0.5（指数增长本身会快速增加）
         # - 动作损失：改为指数增长，权重降低到4
         # - 角速度损失：改为指数增长，权重降低到4
-        # - 推力超限损失：中等权重，约束推力接近悬停推力（Ver10新增，Ver12继承）
+        # - 推力超限损失：中等权重，约束推力接近悬停推力（Ver10新增，Ver12继承，Ver13继承）
         total_loss = (
             0.5 * ori_loss +           # 姿态损失：指数增长，权重降低
             150 * distance_loss +        # 距离损失：零惩罚范围后线性增长，保持较高权重
             3 * velocity_loss +         # 速度损失：零惩罚范围后线性增长，权重提高
             40 * direction_loss +       # 方向损失：零惩罚范围后指数增长，权重稍微降低
-            80 * height_loss +          # 高度损失：零惩罚范围后线性增长，保持较高权重
-            0.04 * action_loss +           # 动作损失：指数增长，权重降低
-            0.01 * omega_loss +            # 角速度损失：指数增长，权重降低
-            0.04 * thrust_loss            # 推力超限损失：中等权重，约束推力接近悬停推力（Ver10新增，Ver12继承）
+            8 * height_loss +          # 高度损失：零惩罚范围后线性增长，保持较高权重
+            0.004 * action_loss +           # 动作损失：指数增长，权重降低
+            0.001 * omega_loss +            # 角速度损失：指数增长，权重降低
+            0.0004 * thrust_loss            # 推力超限损失：中等权重，约束推力接近悬停推力（Ver10新增，Ver12继承，Ver13继承）
         )
         
         # 转换为奖励（负的损失）
@@ -658,7 +670,7 @@ class TrackEnvVer12(env_base.Env[TrackStateVer12]):
     def observation_space(self) -> spaces.Box:
         """Get observation space.
         
-        Ver12修改：继承Ver10，移除观测延迟，直接使用真实状态值
+        Ver13修改：继承Ver12，移除观测延迟，直接使用真实状态值
         
         观测组成：
         1. 机体系速度 (3)
@@ -685,7 +697,7 @@ if __name__ == "__main__":
     
     key_gen = key_generator(0)
 
-    env = TrackEnvVer12()
+    env = TrackEnvVer13()
 
     state, obs = env.reset(next(key_gen))
     print(f"Initial observation shape: {obs.shape}")
