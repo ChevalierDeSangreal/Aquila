@@ -458,7 +458,7 @@ class Quadrotor:
         thrust_max = (thrust_to_weight_ratio * mass * 9.81) / 4.0
         
         # Randomize maximum angular velocity: omega_max in range [1, 4] rad/s
-        omega_max = jax.random.uniform(key_omega, shape=(3,), minval=1.0, maxval=4.0)
+        omega_max = jax.random.uniform(key_omega, shape=(3,), minval=2, maxval=3)
         
         # Randomize motor_tau: ±30% fluctuation around the base value
         tau_multiplier = jax.random.uniform(key_tau, minval=0.7, maxval=1.3)

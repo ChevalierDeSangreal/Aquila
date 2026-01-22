@@ -9,6 +9,9 @@ __pycache__/
 # nohup.out
 *nohup.out
 
+# whl
+*.whl
+
 # temporary output
 *runs/*
 runs/* */

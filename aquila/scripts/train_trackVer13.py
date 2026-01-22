@@ -80,8 +80,8 @@ def main():
         target_height=2.0,  # m (高度2米，实际会在(-2.2, -1.8)范围内随机)
         target_init_distance_min=0.5,  # m (x轴上的初始距离最小值)
         target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
-        target_speed_max=8.0,  # m/s (目标最大速度上限，实际每episode会在0-1之间随机)
-        target_acceleration_max=8,  # m/s² (目标最大加速度，每次reset时在0到此值之间随机生成实际加速度)
+        target_speed_max=2.0,  # m/s (目标最大速度上限，实际每episode会在0-1之间随机)
+        target_acceleration_max=1,  # m/s² (目标最大加速度，每次reset时在0到此值之间随机生成实际加速度)
         reset_distance=100.0,  # m (重置距离阈值)
         max_speed=20.0,  # m/s
         # Parameter randomization (quadrotor)

@@ -635,9 +635,9 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
             3 * velocity_loss +         # 速度损失：零惩罚范围后线性增长，权重提高
             40 * direction_loss +       # 方向损失：零惩罚范围后指数增长，权重稍微降低
             8 * height_loss +          # 高度损失：零惩罚范围后线性增长，保持较高权重
-            0.004 * action_loss +           # 动作损失：指数增长，权重降低
-            0.001 * omega_loss +            # 角速度损失：指数增长，权重降低
-            0.0004 * thrust_loss            # 推力超限损失：中等权重，约束推力接近悬停推力（Ver10新增，Ver12继承，Ver13继承）
+            0.04 * action_loss +           # 动作损失：指数增长，权重降低
+            0.01 * omega_loss +            # 角速度损失：指数增长，权重降低
+            0.04 * thrust_loss            # 推力超限损失：中等权重，约束推力接近悬停推力（Ver10新增，Ver12继承，Ver13继承）
         )
         
         # 转换为奖励（负的损失）
