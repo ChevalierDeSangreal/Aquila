@@ -134,7 +134,7 @@ def test_policy():
     
     # ==================== Load Policy ====================
     # policy_file = 'aquila/param/trackVer8_policy_stabler.pkl'
-    policy_file = '/home/core/wangzimo/Aquila/aquila/param/trackVer13_policy.pkl'
+    policy_file = '/home/wangzimo/VTT/aquila/param/trackVer13_policy.pkl'
     params, env_config, action_repeat, buffer_size = load_trained_policy(policy_file)
     
     # ==================== Environment Setup ====================

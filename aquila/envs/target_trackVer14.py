@@ -1,15 +1,20 @@
 """
-Track Environment Version 13
+Track Environment Version 14
 Full quadrotor tracking environment with a moving target.
-Ver13 modifications: Based on Ver12, used for testing more aggressive reward weights and target acceleration randomization.
-The main differences from Ver12:
+Ver14 modifications: Based on Ver13, adds auxiliary loss for target velocity prediction in body frame.
+The main differences from Ver13:
+- Network now outputs two values: action (4,) and predicted target velocity in body frame (3,)
+- Auxiliary loss is added to reward computation for target velocity prediction
+- During deployment to tflite, the C++ code only reads the first output (action), so no changes needed
+
+Ver13 features (inherited):
 - Uses more aggressive reward weights for testing different training dynamics
 - Target acceleration is randomized per episode (0 to max acceleration) instead of fixed
+- All loss terms are linear to prevent gradient explosion
 
 Ver12 features (inherited):
 - Target initial position: randomized in x, y (±0.2m), and z (-2.2 to -1.8m)
 - Target max speed: randomized from 0 to 1 m/s per episode
-- Target acceleration: randomized from 0 to max acceleration per episode (Ver13 new)
 - Drone initial orientation: roll and pitch randomized within ±30°, yaw fully randomized
 - Drone initial velocity: random direction, magnitude in [0, 0.5] m/s
 - Removed observation delay - uses true state values directly
@@ -49,7 +54,7 @@ class ExtendedQuadrotorParams(QuadrotorParams):
 
 
 @jdc.pytree_dataclass
-class TrackStateVer13:
+class TrackStateVer14:
     time: float
     step_idx: int
     quadrotor_state: QuadrotorState
@@ -65,6 +70,8 @@ class TrackStateVer13:
     filtered_thrust: float = field_jnp(9.8)
     # Flag to track if distance has ever exceeded reset_distance
     has_exceeded_distance: bool = False
+    # Ver14 new: auxiliary output for target velocity prediction (body frame)
+    aux_target_vel_pred: jax.Array = field_jnp(jnp.zeros(3))
 
 
 @jax.jit
@@ -90,8 +97,8 @@ def safe_norm(x, eps=1e-8):
     return jnp.sqrt(jnp.sum(x * x) + eps)
 
 
-class TrackEnvVer13(env_base.Env[TrackStateVer13]):
-    """Quadrotor tracking environment Ver13 - based on Ver12, used for testing more aggressive reward weights and target acceleration randomization."""
+class TrackEnvVer14(env_base.Env[TrackStateVer14]):
+    """Quadrotor tracking environment Ver14 - based on Ver13, adds auxiliary loss for target velocity prediction."""
     
     def __init__(
         self,
@@ -164,7 +171,7 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         self.disturbance_mag = disturbance_mag
 
     def reset(
-        self, key: chex.PRNGKey, state: Optional[TrackStateVer13] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
+        self, key: chex.PRNGKey, state: Optional[TrackStateVer14] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
         """Reset environment with tracking-specific initialization.
         
         Args:
@@ -306,8 +313,11 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         action_raw = jax.device_put(jnp.zeros(4))
         filtered_acc = jax.device_put(jnp.array([0.0, 0.0, 9.81]))  # NED坐标系，Down为正
         filtered_thrust = jax.device_put(jnp.array(thrust_hover))
+        
+        # Ver14 new: initialize auxiliary output
+        aux_target_vel_pred = jax.device_put(jnp.zeros(3))
 
-        state = TrackStateVer13(
+        state = TrackStateVer14(
             time=0.0,
             step_idx=0,
             quadrotor_state=quadrotor_state,
@@ -322,14 +332,15 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
             filtered_acc=filtered_acc,
             filtered_thrust=filtered_thrust,
             has_exceeded_distance=False,
+            aux_target_vel_pred=aux_target_vel_pred,
         )
         
         return state, self._get_obs(state)
 
-    def _get_obs(self, state: TrackStateVer13) -> jax.Array:
+    def _get_obs(self, state: TrackStateVer14) -> jax.Array:
         """Get observation from state.
         
-        Ver13修改：继承Ver12，移除观测延迟，直接使用真实状态值
+        Ver14修改：继承Ver13，移除观测延迟，直接使用真实状态值
         
         观测组成：
         1. 无人机机体系自身速度向量 (3)
@@ -365,16 +376,32 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _step(
-        self, state: TrackStateVer13, action: jax.Array, key: chex.PRNGKey
+        self, state: TrackStateVer14, action: jax.Array, key: chex.PRNGKey
     ) -> EnvTransition:
+        """Execute one step in the environment.
+        
+        Ver14修改：action现在是一个包含两个元素的tuple/list:
+        - action[0]: 实际控制动作 (4,)，范围[-1, 1]
+        - action[1]: 辅助输出，目标速度预测（机体系） (3,)
+        """
+        # Ver14: 解析action和辅助输出
+        # 如果action是tuple/list，则第一个是动作，第二个是辅助输出
+        # 如果只是数组，则没有辅助输出（向后兼容）
+        if isinstance(action, (tuple, list)):
+            action_main = action[0]
+            aux_target_vel_pred = action[1]
+        else:
+            action_main = action
+            aux_target_vel_pred = jnp.zeros(3)
+        
         # 保存原始action (tanh输出为[-1,1]范围)
-        action_raw = action
+        action_raw = action_main
         
         # 将tanh输出的action [-1, 1] 映射到实际范围
         # thrust: [-1, 1] -> [thrust_min*4, thrust_max*4]（保持从0开始映射）
         # omega: [-1, 1] -> [-omega_max, omega_max]（对称映射，0对应静止）
-        thrust_normalized = action[0]
-        omega_normalized = action[1:]
+        thrust_normalized = action_main[0]
+        omega_normalized = action_main[1:]
         
         # Thrust映射：[-1, 1] -> [thrust_min*4, thrust_max*4]
         # ⚠️  使用当前状态的实际thrust_max（参数随机化后的值）
@@ -388,16 +415,16 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         actual_omega_max = state.quad_params.omega_max
         omega_denormalized = omega_normalized * actual_omega_max
         
-        action = jnp.concatenate([jnp.array([thrust_denormalized]), omega_denormalized])
+        action_processed = jnp.concatenate([jnp.array([thrust_denormalized]), omega_denormalized])
         
         # clip action to physical limits (使用实际参数)
         action_low = jnp.concatenate([jnp.array([self.thrust_min * 4]), -actual_omega_max])
         action_high = jnp.concatenate([jnp.array([actual_thrust_max * 4]), actual_omega_max])
-        action = jnp.clip(action, action_low, action_high)
+        action_processed = jnp.clip(action_processed, action_low, action_high)
 
         # add action to last actions
         last_actions = jnp.roll(state.last_actions, shift=-1, axis=0)
-        last_actions = last_actions.at[-1].set(action)
+        last_actions = last_actions.at[-1].set(action_processed)
 
         # 1 step
         dt_1 = self.delay % self.dt
@@ -453,7 +480,7 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         target_vel = new_speed * state.target_direction
         target_pos = state.target_pos + target_vel * self.dt
         
-        # 检查距离是否超过10m，更新标志位
+        # 检查距离是否超过reset_distance，更新标志位
         distance_to_target = safe_norm(quadrotor_state.p - target_pos, eps=1e-8)
         has_exceeded_distance = state.has_exceeded_distance | (distance_to_target > self.reset_distance)
         
@@ -473,12 +500,13 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
             target_vel=target_vel,
             target_direction=state.target_direction,  # 保持方向不变
             has_exceeded_distance=has_exceeded_distance,
+            aux_target_vel_pred=aux_target_vel_pred,  # Ver14: 保存辅助输出
         )
 
         obs = self._get_obs(next_state)
         reward = self._compute_reward(state, next_state)
         
-        # 检查是否需要重置（距离大于10m）
+        # 检查是否需要重置（距离大于reset_distance）
         distance_to_target = safe_norm(next_state.quadrotor_state.p - next_state.target_pos, eps=1e-8)
         terminated = distance_to_target > self.reset_distance
         
@@ -502,9 +530,9 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         )
 
     def _compute_reward(
-        self, last_state: TrackStateVer13, next_state: TrackStateVer13
+        self, last_state: TrackStateVer14, next_state: TrackStateVer14
     ) -> jax.Array:
-        """计算奖励 - 基于Ver12，所有损失项都改为线性增长以防止梯度爆炸
+        """计算奖励 - 基于Ver13，添加辅助损失（目标速度预测）
         奖励设计：
         1. 方向损失：使用余弦相似度计算完整3D方向（线性）
         2. 距离损失：水平距离与目标距离的绝对差值（线性）
@@ -514,8 +542,9 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         6. 动作损失：当前动作与上一动作的L2范数（线性）
         7. 角速度损失：惩罚旋转运动（防止roll持续旋转）（线性）
         8. 推力超限损失：动作推力与悬停推力的偏差（线性）
+        9. Ver14新增：辅助损失（目标速度预测）- 预测值与真实值的L2距离（线性）
         
-        Ver13修改：将所有指数损失改为线性损失，防止在target_acceleration_max增大时出现梯度爆炸
+        Ver14修改：添加辅助损失（目标速度在机体系下的预测）
         """
         # 获取状态信息
         quad_pos = next_state.quadrotor_state.p
@@ -529,40 +558,42 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         p_rel = target_pos - quad_pos
         v_rel = target_vel - quad_vel
         
-        # 1. 方向损失 (direction) - 使用余弦相似度计算完整3D方向
+        # 1. 方向损失 (direction) - 基于平方比例的损失函数
         # 将相对位置向量转换到机体坐标系
         R_transpose = jnp.transpose(quad_R)
         direction_vector_body = R_transpose @ p_rel
-        direction_vector_body_unit = direction_vector_body / (safe_norm(direction_vector_body, eps=1e-6))
         
-        init_vec = jnp.array([1.0, 0.0, 0.0])  # 机体前向方向（完整3D）
-        cos_similarity = jnp.dot(init_vec, direction_vector_body_unit)
-        cos_similarity = jnp.clip(cos_similarity, -1.0, 1.0)
+        # 提取分量
+        x = direction_vector_body[0]
+        y = direction_vector_body[1]
+        z = direction_vector_body[2]
         
-        # 零惩罚范围：方向 < 15° 时损失为0
-        # cos(15°) ≈ 0.966
-        cos_threshold = jnp.cos(jnp.deg2rad(15.0))
-        # 改为线性损失：使用 1 - cos_similarity 作为误差度量
-        direction_error = 1.0 - cos_similarity
-        direction_error_threshold = 1.0 - cos_threshold
-        # 在阈值内损失为0，超出后从阈值处开始线性增加
-        direction_loss = jnp.where(
-            cos_similarity >= cos_threshold,
-            0.0,
-            direction_error - direction_error_threshold  # 线性增长
-        )
-        # ========== 原版本（指数增长）- 已注释，方便回退 ==========
-        # direction_loss_base = jnp.exp(1 - cos_similarity) - 1
-        # # 计算阈值处的损失值，用于保持连续性
-        # threshold_loss = jnp.exp(1 - cos_threshold) - 1
-        # # 在阈值内损失为0，超出后从阈值处开始线性增加
-        # direction_loss = jnp.where(
-        #     cos_similarity >= cos_threshold,
-        #     0.0,
-        #     direction_loss_base - threshold_loss  # 减去阈值处的损失，使在阈值处连续
-        # )
+        # 计算分母：x² + y² + z² + ε
+        eps = 1e-3
+        norm_sq = x * x + y * y + z * z
+        denominator = norm_sq + eps
         
+        # 水平偏差：y²/(x²+y²+z²+ε)
+        horizontal_deviation = (y * y) / denominator
         
+        # 垂直偏差：z²/(x²+y²+z²+ε)
+        vertical_deviation = (z * z) / denominator
+        
+        # 正面约束：(1 - x̂)²，其中 x̂ = x/√(x²+y²+z²)
+        norm = jnp.sqrt(norm_sq + eps)
+        x_normalized = x / norm
+        forward_constraint = (1.0 - x_normalized) ** 2
+        
+        # 权重（可根据需要调整）
+        w_h = 0.0  # 水平偏差权重
+        w_v = 1.0  # 垂直偏差权重
+        w_f = 1.0  # 正面约束权重
+        
+        # 计算总的方向损失
+        direction_loss = w_h * horizontal_deviation + w_v * vertical_deviation + w_f * forward_constraint
+
+       
+
         # 2. 距离损失 (distance) - 水平距离与目标距离的绝对差值
         norm_hor_dis = safe_norm(p_rel[:2], eps=1e-8)
         target_distance = 1.0  # 目标距离1米
@@ -601,9 +632,6 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         # 改为线性损失：使用偏离度的平方根或直接使用偏离度
         ori_deviation = jnp.abs(body_z_world[2] + 1.0)  # 偏离度（0到2之间，线性度量）
         ori_loss = ori_deviation  # 线性增长
-        # ========== 原版本（指数增长）- 已注释，方便回退 ==========
-        # ori_deviation = (body_z_world[2] + 1.0) ** 2  # 偏离度（0到4之间）
-        # ori_loss = 10 * (jnp.exp(ori_deviation) - 1.0)  # 指数增长
         
         # 6. 动作损失 (aux) - 当前动作与上一动作的L2范数，改为线性增长
         action_current = next_state.action_raw
@@ -615,17 +643,13 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         action_change = action_current - action_last
         action_error = safe_norm(action_change, eps=1e-8)
         action_loss = action_error  # 线性增长
-        # ========== 原版本（指数增长）- 已注释，方便回退 ==========
-        # action_loss = jnp.exp(action_error) - 1.0  # 指数增长
         
         # 7. 角速度损失 - 防止持续旋转（只惩罚roll和pitch，不惩罚yaw），改为线性增长
         omega_roll_pitch = quad_omega[:2]  # 只取roll和pitch角速度，忽略yaw
         omega_error = safe_norm(omega_roll_pitch, eps=1e-8)
         omega_loss = omega_error  # 线性增长
-        # ========== 原版本（指数增长）- 已注释，方便回退 ==========
-        # omega_loss = jnp.exp(omega_error) - 1.0  # 指数增长
         
-        # 8. 推力超限损失 - 约束推力，动作推力与悬停推力的偏差（Ver10新增，参考hoverVer1，Ver12继承）
+        # 8. 推力超限损失 - 约束推力，动作推力与悬停推力的偏差（Ver10新增，参考hoverVer1，Ver14继承）
         # 使用当前动作（归一化后的值），需要去归一化
         thrust_normalized = action_current[0]
         # 去归一化推力：[-1, 1] -> [thrust_min*4, thrust_max*4]
@@ -636,48 +660,37 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
         # 计算推力偏差的绝对值，改为线性增长
         thrust_error = jnp.abs(action_thrust - thrust_hover)
         thrust_loss = thrust_error  # 线性增长
-        # ========== 原版本（指数增长）- 已注释，方便回退 ==========
-        # thrust_loss = jnp.exp(thrust_error) - 1.0  # 指数增长
+        
+        # 9. Ver14新增：辅助损失 - 目标速度预测（机体系）
+        # 真实的目标速度（世界系）转换到机体系
+        target_vel_body_true = R_transpose @ target_vel
+        # 预测的目标速度（机体系）
+        target_vel_body_pred = next_state.aux_target_vel_pred
+        # L2距离作为损失
+        aux_error = safe_norm(target_vel_body_true - target_vel_body_pred, eps=1e-8)
+        aux_loss = aux_error  # 线性增长
         
         # 总损失 - 所有损失项都改为线性增长，需要重新调整权重
         # 权重调整说明：
-        # - 方向损失：有零惩罚范围(<15°)，超出后线性增长，权重调整为50
+        # - 方向损失：使用Ver13的实现，有零惩罚范围(<15°)，超出后线性增长，权重参考Ver13
         # - 位置损失（距离和高度）：有零惩罚范围(<30cm)，超出后线性增长，保持较高权重
         # - 速度损失：有零惩罚范围(<0.3m/s)，超出后线性增长
-        # - 姿态损失：改为线性增长，权重调整为5（线性增长需要更高权重）
+        # - 姿态损失：改为线性增长，权重调整为0.5（线性增长需要更高权重）
         # - 动作损失：改为线性增长，权重调整为20（线性增长需要更高权重）
         # - 角速度损失：改为线性增长，权重调整为5（线性增长需要更高权重）
         # - 推力超限损失：线性增长，权重调整为0.1（线性增长需要更高权重）
+        # - Ver14新增：辅助损失（目标速度预测），权重为1.0
         total_loss = (
             0.5 * ori_loss +             # 姿态损失：线性增长，权重提高
-            500 * distance_loss +      # 距离损失：零惩罚范围后线性增长，保持较高权重
-            3 * velocity_loss +        # 速度损失：零惩罚范围后线性增长
-            1000 * direction_loss +      # 方向损失：零惩罚范围后线性增长，权重提高
-            80 * height_loss +          # 高度损失：零惩罚范围后线性增长，保持较高权重
-            10 * action_loss +         # 动作损失：线性增长，权重提高
-            50 * omega_loss +           # 角速度损失：线性增长，权重提高
-            0.01 * thrust_loss          # 推力超限损失：线性增长，权重提高
+            300 * distance_loss +        # 距离损失：零惩罚范围后线性增长，保持较高权重
+            3 * velocity_loss +          # 速度损失：零惩罚范围后线性增长
+            500 * direction_loss +      # 方向损失：零惩罚范围后线性增长，权重参考Ver13
+            50 * height_loss +            # 高度损失：零惩罚范围后线性增长，保持较高权重
+            10 * action_loss +           # 动作损失：线性增长，权重提高
+            50 * omega_loss +             # 角速度损失：线性增长，权重提高
+            0.01 * thrust_loss +          # 推力超限损失：线性增长，权重提高
+            0.1 * aux_loss               # Ver14新增：辅助损失（目标速度预测）
         )
-        # ========== 原版本（指数增长权重）- 已注释，方便回退 ==========
-        # 总损失 - 根据新的损失函数特性调整权重
-        # 权重调整说明：
-        # - 方向损失：有零惩罚范围(<15°)，超出后指数增长，权重降低到40
-        # - 位置损失（距离和高度）：有零惩罚范围(<30cm)，超出后线性增长，保持较高权重80
-        # - 速度损失：有零惩罚范围(<0.3m/s)，超出后线性增长，权重提高到3
-        # - 姿态损失：改为指数增长，权重降低到0.5（指数增长本身会快速增加）
-        # - 动作损失：改为指数增长，权重降低到4
-        # - 角速度损失：改为指数增长，权重降低到4
-        # - 推力超限损失：中等权重，约束推力接近悬停推力（Ver10新增，Ver12继承，Ver13继承）
-        # total_loss = (
-        #     0.5 * ori_loss +           # 姿态损失：指数增长，权重降低
-        #     150 * distance_loss +        # 距离损失：零惩罚范围后线性增长，保持较高权重
-        #     3 * velocity_loss +         # 速度损失：零惩罚范围后线性增长，权重提高
-        #     40 * direction_loss +       # 方向损失：零惩罚范围后指数增长，权重稍微降低
-        #     8 * height_loss +          # 高度损失：零惩罚范围后线性增长，保持较高权重
-        #     10 * action_loss +           # 动作损失：指数增长，权重降低
-        #     1 * omega_loss +            # 角速度损失：指数增长，权重降低
-        #     0.04 * thrust_loss            # 推力超限损失：中等权重，约束推力接近悬停推力（Ver10新增，Ver12继承，Ver13继承）
-        # )
         
         # 转换为奖励（负的损失）
         reward = -total_loss
@@ -709,7 +722,7 @@ class TrackEnvVer13(env_base.Env[TrackStateVer13]):
     def observation_space(self) -> spaces.Box:
         """Get observation space.
         
-        Ver13修改：继承Ver12，移除观测延迟，直接使用真实状态值
+        Ver14修改：继承Ver13，移除观测延迟，直接使用真实状态值
         
         观测组成：
         1. 机体系速度 (3)
@@ -736,7 +749,7 @@ if __name__ == "__main__":
     
     key_gen = key_generator(0)
 
-    env = TrackEnvVer13()
+    env = TrackEnvVer14()
 
     state, obs = env.reset(next(key_gen))
     print(f"Initial observation shape: {obs.shape}")
@@ -745,11 +758,25 @@ if __name__ == "__main__":
     print(f"Initial target position: {state.target_pos}")
     print(f"Initial distance: {jnp.linalg.norm(state.quadrotor_state.p - state.target_pos)}")
     
+    # Test with both action formats
+    # Format 1: only action (backward compatible)
     random_action = env.action_space.sample(next(key_gen))
     transition = env.step(state, random_action, next(key_gen))
     state, obs, reward, terminated, truncated, info = transition
-    print(f"\nAfter step:")
+    print(f"\nAfter step (format 1 - action only):")
     print(f"Observation: {obs}")
     print(f"Reward: {reward}")
     print(f"Distance to target: {info['distance_to_target']}")
     print(f"Terminated: {terminated}")
+    
+    # Format 2: action + auxiliary output
+    random_action = env.action_space.sample(next(key_gen))
+    random_aux = jax.random.normal(next(key_gen), (3,))
+    transition = env.step(state, (random_action, random_aux), next(key_gen))
+    state, obs, reward, terminated, truncated, info = transition
+    print(f"\nAfter step (format 2 - action + aux):")
+    print(f"Observation: {obs}")
+    print(f"Reward: {reward}")
+    print(f"Distance to target: {info['distance_to_target']}")
+    print(f"Terminated: {terminated}")
+    print(f"Aux output shape: {state.aux_target_vel_pred.shape}")

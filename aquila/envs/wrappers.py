@@ -158,10 +158,19 @@ class NormalizeActionWrapper(EnvWrapper):
 
     def map_action(self, action):
         # map action from [-1, 1] to action bounds
-        action = (action + 1.0) / 2.0 * (
-            self._env.action_space.high - self._env.action_space.low
-        ) + self._env.action_space.low
-        return action
+        # Handle both array and tuple formats (e.g., (action, aux_output))
+        if isinstance(action, tuple):
+            action_array = action[0]
+            aux_data = action[1:]
+            action_normalized = (action_array + 1.0) / 2.0 * (
+                self._env.action_space.high - self._env.action_space.low
+            ) + self._env.action_space.low
+            return (action_normalized,) + aux_data
+        else:
+            action = (action + 1.0) / 2.0 * (
+                self._env.action_space.high - self._env.action_space.low
+            ) + self._env.action_space.low
+            return action
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action, key) -> EnvTransition:

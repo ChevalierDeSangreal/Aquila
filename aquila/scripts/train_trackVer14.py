@@ -19,21 +19,23 @@ import optax
 from flax.training.train_state import TrainState
 import pickle
 from torch.utils.tensorboard import SummaryWriter
+from flax import linen as nn
 
 # Add parent directory to path for imports
-# aquila/scripts/train_trackVer13.py -> ../../ -> Aquila project root
+# aquila/scripts/train_trackVer14.py -> ../../ -> Aquila project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.target_trackVer13 import TrackEnvVer13  # 使用TrackEnvVer13（基于Ver12，使用更激进的权重和目标加速度随机化）
+from aquila.envs.target_trackVer14 import TrackEnvVer14  # 使用TrackEnvVer14（基于Ver13，添加辅助损失）
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
-from aquila.algos import bptt
+from aquila.algos import bpttVer2
 
 """
-TrackVer13: 基于Ver12，使用更激进的权重和目标加速度随机化，训练50Hz运行的网络
+TrackVer14: 基于Ver13，添加辅助损失（目标速度预测）
 - action_repeat = 2 (每2个step才获取一次新动作，每秒50次动作，每次持续0.02秒)
 - buffer_size = 50 (动作-状态缓冲区大小)
-- target_acceleration_max: 目标最大加速度，每次reset时在0到此值之间随机生成实际加速度
+- 网络输出：动作 (4,) + 辅助输出 (3,) = 目标速度预测（机体系）
+- 辅助损失：预测值与真实值的L2距离，权重为1.0
 """
 
 
@@ -69,8 +71,8 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Environment Setup ====================
-    # Create env - 使用TrackEnvVer13环境（基于Ver12，使用更激进的权重和目标加速度随机化），训练50Hz网络
-    env = TrackEnvVer13(
+    # Create env - 使用TrackEnvVer14环境（基于Ver13，添加辅助损失），训练50Hz网络
+    env = TrackEnvVer14(
         max_steps_in_episode=1000,  # 追踪任务的最大步数
         dt=0.01,  # 使用完整四旋翼的默认时间步长
         delay=0.03,  # 可选执行延迟
@@ -80,7 +82,7 @@ def main():
         target_height=2.0,  # m (高度2米，实际会在(-2.2, -1.8)范围内随机)
         target_init_distance_min=0.5,  # m (x轴上的初始距离最小值)
         target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
-        target_speed_max=6.0,  # m/s (目标最大速度上限，实际每episode会在0-1之间随机)
+        target_speed_max=5.0,  # m/s (目标最大速度上限，实际每episode会在0-1之间随机)
         target_acceleration_max=8,  # m/s² (目标最大加速度，每次reset时在0到此值之间随机生成实际加速度)
         reset_distance=100.0,  # m (重置距离阈值)
         max_speed=20.0,  # m/s
@@ -101,13 +103,16 @@ def main():
     obs_dim = env.observation_space.shape[0]
     input_dim = buffer_size * (obs_dim + action_dim)  # 输入维度为缓冲区大小乘以(观测维度+动作维度)
     
-    # 创建MLP网络，输入维度为buffer_size * (obs_dim + action_dim)
-    policy = MLP([input_dim, 128, 128, action_dim], initial_scale=0.2)
+    # 创建策略网络，输出7维：action (4,) + aux_output (3,)
+    # 使用MLP直接输出7维，然后在bpttVer2中分割成 (action, aux_output)
+    output_dim = action_dim + 3  # 4个动作 + 3个辅助输出
+    policy = MLP([input_dim, 128, 128, output_dim], initial_scale=0.2)
     
     print(f"Observation dimension: {obs_dim}")
     print(f"Action dimension: {action_dim}")
     print(f"Action-obs buffer size: {buffer_size}")
     print(f"Input dimension (buffer_size * (obs_dim + action_dim)): {input_dim}")
+    print(f"Network output: {output_dim}维 (action {action_dim} + aux_output 3)")
     
     # ==================== Training Parameters ====================
     num_epochs = 4000  # 训练轮数
@@ -146,7 +151,7 @@ def main():
         print("✅ 使用初始网络参数开始训练")
     else:
         # 使用加载的参数
-        policy_file = 'aquila/param/trackVer13_policy.pkl'  # 使用Ver13的模型文件
+        policy_file = 'aquila/param/trackVer14_policy.pkl'  # 使用Ver14的模型文件
         loaded_params, env_config = load_trained_policy(policy_file)
         train_state = TrainState.create(
             apply_fn=policy.apply,
@@ -157,36 +162,31 @@ def main():
     
     # ==================== TensorBoard Setup ====================
     # 创建tensorboard日志目录
-    log_dir = f'runs/trackVer13_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用Ver13的日志目录
+    log_dir = f'runs/trackVer14_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用Ver14的日志目录
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard logs will be saved to: {log_dir}")
     print(f"Run 'tensorboard --logdir=runs' to view training progress")
     
-    # 设置 tensorboard writer 到 bptt 模块（用于实时记录）
-    bptt.set_tensorboard_writer(writer)
+    # 设置 tensorboard writer 到 bpttVer2 模块（用于实时记录）
+    bpttVer2.set_tensorboard_writer(writer)
     
     # ==================== Training ====================
     time_start = time.time()
     training_log = []
     
     print(f"\n{'='*60}")
-    print(f"开始训练追踪任务 (TrackVer13 - 基于Ver12，使用更激进的权重和目标加速度随机化，训练50Hz运行的网络)...")
+    print(f"开始训练追踪任务 (TrackVer14 - 基于Ver13，添加辅助损失，训练50Hz运行的网络)...")
     print(f"Total environments: {num_envs}")
     print(f"Number of epochs: {num_epochs}")
     print(f"Steps per epoch: {env.max_steps_in_episode}")
     print(f"Action repeat: {action_repeat} steps")
     print(f"Action-obs buffer size: {buffer_size}")
     print(f"Input dimension: {input_dim}")
+    print(f"Network output: action + aux_target_vel (辅助损失)")
     print(f"Quadrotor model: Full (Quadrotor - based on agilicious framework)")
     print(f"{'='*60}\n")
     
-    # 使用单卡训练函数
-    print("正在调用 bptt.train()...")
-    print("注意：首次调用会进行 JIT 编译，可能需要1-2分钟...")
-    import sys
-    sys.stdout.flush()
-    
-    res_dict = bptt.train(
+    res_dict = bpttVer2.train(
         env=env,
         train_state=train_state,
         num_epochs=num_epochs,
@@ -235,6 +235,7 @@ def main():
     writer.add_scalar('Config/action_obs_buffer_size', buffer_size, 0)
     writer.add_scalar('Config/input_dimension', input_dim, 0)
     writer.add_scalar('Config/effective_actions_per_epoch', env.max_steps_in_episode / action_repeat, 0)
+    writer.add_scalar('Config/auxiliary_loss', 1.0, 0)  # Ver14新增：辅助损失权重
     
     # 获取更新后的训练状态
     train_state = res_dict["runner_state"].train_state
@@ -242,7 +243,7 @@ def main():
     
     # ==================== Print Summary ====================
     print(f"\n{'='*60}")
-    print(f"追踪任务训练完成！(TrackVer13 - 基于Ver12，使用更激进的权重和目标加速度随机化，训练50Hz运行的网络)")
+    print(f"追踪任务训练完成！(TrackVer14 - 基于Ver13，添加辅助损失，训练50Hz运行的网络)")
     print(f"{'='*60}")
     print(f"Training time: {training_time:.2f} seconds ({training_time/60:.2f} minutes)")
     print(f"Final Loss: {final_loss:.6f}")
@@ -252,8 +253,8 @@ def main():
     print(f"Action-obs buffer size: {buffer_size}")
     print(f"Input dimension: {input_dim}")
     print(f"Effective actions per epoch: {env.max_steps_in_episode / action_repeat:.1f}")
+    print(f"Network output: action + aux_target_vel (辅助损失)")
     print(f"Quadrotor model: Full (Quadrotor - based on agilicious framework)")
-    
     
     
     # ==================== Save Model ====================
@@ -272,7 +273,7 @@ def main():
             'dt': env.dt,
             'delay': env.delay,
             'action_penalty_weight': env.action_penalty_weight,
-            # Ver13 基于Ver12，使用更激进的权重和目标加速度随机化，训练50Hz运行的网络：目标位置y和z随机，roll/pitch±30°随机，yaw完全随机，初始速度0-0.5m/s随机方向，目标速度每episode随机，目标加速度每episode随机（0到最大加速度之间），奖励中加入推力惩罚
+            # Ver14 基于Ver13，添加辅助损失：目标位置y和z随机，roll/pitch±30°随机，yaw完全随机，初始速度0-0.5m/s随机方向，目标速度每episode随机，目标加速度每episode随机（0到最大加速度之间），奖励中加入推力惩罚和辅助损失（目标速度预测）
             'target_height': env.target_height,
             'target_init_distance_min': env.target_init_distance_min,
             'target_init_distance_max': env.target_init_distance_max,
@@ -287,14 +288,14 @@ def main():
     os.makedirs('aquila/param', exist_ok=True)
     
     # 保存为pickle文件
-    checkpoint_path = 'aquila/param/trackVer13_policy.pkl'  # 使用Ver13的文件名
+    checkpoint_path = 'aquila/param/trackVer14_policy.pkl'  # 使用Ver14的文件名
     with open(checkpoint_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"\n✅ Trained tracking policy saved as: {checkpoint_path}")
     
     # 额外保存一个带时间戳的备份
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = f'aquila/param/trackVer13_policy_{timestamp}.pkl'  # 使用Ver13的文件名
+    backup_path = f'aquila/param/trackVer14_policy_{timestamp}.pkl'  # 使用Ver14的文件名
     with open(backup_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"✅ Backup saved as: {backup_path}")

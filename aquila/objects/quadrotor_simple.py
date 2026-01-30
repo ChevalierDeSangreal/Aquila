@@ -194,7 +194,7 @@ class QuadrotorSimple:
             params = self.default_params()
 
         # 简单的比例控制
-        K_p = jnp.array([22.0, 22.0, 12.0])
+        K_p = jnp.array([22.0, 22.0, 22.0])
         omega_error = omega_d - current_omega
 
         # 计算期望力矩
