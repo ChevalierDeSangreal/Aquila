@@ -25,17 +25,18 @@ from flax import linen as nn
 # aquila/scripts/train_trackVer14.py -> ../../ -> Aquila project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.target_trackVer14 import TrackEnvVer14  # 使用TrackEnvVer14（基于Ver13，添加辅助损失）
+from aquila.envs.target_trackVer15 import TrackEnvVer15  # 使用TrackEnvVer15（基于Ver14，添加约束违规检查）
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
 from aquila.algos import bpttVer2
 
 """
-TrackVer14: 基于Ver13，添加辅助损失（目标速度预测）
+TrackVer15: 基于Ver14，添加约束违规检查
 - action_repeat = 2 (每2个step才获取一次新动作，每秒50次动作，每次持续0.02秒)
 - buffer_size = 50 (动作-状态缓冲区大小)
 - 网络输出：动作 (4,) + 辅助输出 (3,) = 目标速度预测（机体系）
-- 辅助损失：预测值与真实值的L2距离，权重为1.0
+- 辅助损失：预测值与真实值的L2距离，权重为0.1
+- Ver15新增：维护约束违规标志，超过距离或速度阈值时reward乘0，不参与梯度更新
 """
 
 
@@ -71,9 +72,9 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Environment Setup ====================
-    # Create env - 使用TrackEnvVer14环境（基于Ver13，添加辅助损失），训练50Hz网络
-    env = TrackEnvVer14(
-        max_steps_in_episode=600,  # 追踪任务的最大步数
+    # Create env - 使用TrackEnvVer15环境（基于Ver14，添加约束违规检查），训练50Hz网络
+    env = TrackEnvVer15(
+        max_steps_in_episode=1000,  # 追踪任务的最大步数
         dt=0.01,  # 使用完整四旋翼的默认时间步长
         delay=0.03,  # 可选执行延迟
         omega_std=0.1,
@@ -84,12 +85,15 @@ def main():
         target_init_distance_max=1.5,  # m (x轴上的初始距离最大值)
         target_speed_max=3.0,  # m/s (目标最大速度上限，实际每episode会在0-1之间随机)
         target_acceleration_max=5,  # m/s² (目标最大加速度，每次reset时在0到此值之间随机生成实际加速度)
-        reset_distance=100.0,  # m (重置距离阈值)
-        max_speed=20.0,  # m/s
+        reset_distance=25.0,  # m (重置距离阈值)
+        max_speed=15.0,  # m/s
         # Parameter randomization (quadrotor)
         thrust_to_weight_min=1.2,  # 最小推重比
         thrust_to_weight_max=5.0,  # 最大推重比
         disturbance_mag=2.0,  # 训练时开启常值随机扰动（2N），提高鲁棒性
+        # Ver15 new: constraint thresholds
+        constraint_max_distance=25.0,  # m (最大距离约束，超过则reward乘0)
+        constraint_max_velocity=15.0,  # m/s (最大速度约束，超过则reward乘0)
     )
     
     # Normalize obs to [-1,1] and actions to [-1,1]
@@ -115,24 +119,21 @@ def main():
     print(f"Network output: {output_dim}维 (action {action_dim} + aux_output 3)")
     
     # ==================== Training Parameters ====================
-    num_epochs = 10000  # 训练轮数
+    num_epochs = 6000  # 训练轮数
     num_envs = 512 # 并行环境数（单卡）
     
     # 动作重复参数
     action_repeat = 2  # 每2个step才获取一次新动作（每秒50次动作，每次持续0.02秒）
     
     # Optimizer - 使用余弦衰减学习率
-    initial_learning_rate = 1e-2
+    initial_learning_rate = 5e-3
     end_learning_rate = 5e-4
     scheduler = optax.cosine_decay_schedule(
         init_value=initial_learning_rate,
         decay_steps=num_epochs,
         alpha=end_learning_rate/initial_learning_rate
     )
-    tx = optax.chain(
-        optax.clip_by_global_norm(1.0),  # 梯度裁剪
-        optax.adam(scheduler)
-    )
+    tx = optax.adam(scheduler)  # 使用原始梯度，不进行裁剪
     
     # Init params
     key = jax.random.key(0)
@@ -151,7 +152,7 @@ def main():
         print("✅ 使用初始网络参数开始训练")
     else:
         # 使用加载的参数
-        policy_file = 'aquila/param/trackVer14_policy.pkl'  # 使用Ver14的模型文件
+        policy_file = 'aquila/param/trackVer15_policy.pkl'  # 使用Ver15的模型文件
         loaded_params, env_config = load_trained_policy(policy_file)
         train_state = TrainState.create(
             apply_fn=policy.apply,
@@ -162,7 +163,7 @@ def main():
     
     # ==================== TensorBoard Setup ====================
     # 创建tensorboard日志目录
-    log_dir = f'runs/trackVer14_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用Ver14的日志目录
+    log_dir = f'runs/trackVer15_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用Ver15的日志目录
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard logs will be saved to: {log_dir}")
     print(f"Run 'tensorboard --logdir=runs' to view training progress")
@@ -175,7 +176,7 @@ def main():
     training_log = []
     
     print(f"\n{'='*60}")
-    print(f"开始训练追踪任务 (TrackVer14 - 基于Ver13，添加辅助损失，训练50Hz运行的网络)...")
+    print(f"开始训练追踪任务 (TrackVer15 - 基于Ver14，添加约束违规检查，训练50Hz运行的网络)...")
     print(f"Total environments: {num_envs}")
     print(f"Number of epochs: {num_epochs}")
     print(f"Steps per epoch: {env.max_steps_in_episode}")
@@ -183,6 +184,8 @@ def main():
     print(f"Action-obs buffer size: {buffer_size}")
     print(f"Input dimension: {input_dim}")
     print(f"Network output: action + aux_target_vel (辅助损失)")
+    print(f"Constraint max distance: {env.constraint_max_distance} m")
+    print(f"Constraint max velocity: {env.constraint_max_velocity} m/s")
     print(f"Quadrotor model: Full (Quadrotor - based on agilicious framework)")
     print(f"{'='*60}\n")
     
@@ -211,31 +214,42 @@ def main():
     
     # 补充记录每个epoch的损失到tensorboard（填补实时记录的间隙）
     print("\n补充记录训练数据到 TensorBoard...")
-    for epoch_idx in range(num_epochs):
-        loss_value = float(losses_np[epoch_idx])
-        # 这里会覆盖之前实时记录的值，但没关系，数据是一致的
-        writer.add_scalar('Loss/train_complete', loss_value, epoch_idx)
-        training_log.append(loss_value)
+    try:
+        for epoch_idx in range(num_epochs):
+            loss_value = float(losses_np[epoch_idx])
+            # 这里会覆盖之前实时记录的值，但没关系，数据是一致的
+            writer.add_scalar('Loss/train_complete', loss_value, epoch_idx)
+            training_log.append(loss_value)
+            
+            # 每100个epoch打印一次
+            if (epoch_idx + 1) % 100 == 0:
+                print(f"Epoch {epoch_idx + 1}/{num_epochs}, Loss: {loss_value:.6f}")
         
-        # 每100个epoch打印一次
-        if (epoch_idx + 1) % 100 == 0:
-            print(f"Epoch {epoch_idx + 1}/{num_epochs}, Loss: {loss_value:.6f}")
-    
-    
-    # 记录损失统计信息
-    writer.add_scalar('Loss/initial', float(losses_np[0]), 0)
-    writer.add_scalar('Loss/final', float(losses_np[-1]), 0)
-    writer.add_scalar('Loss/min', float(np.min(losses_np)), 0)
-    writer.add_scalar('Loss/max', float(np.max(losses_np)), 0)
-    writer.add_scalar('Loss/mean', float(np.mean(losses_np)), 0)
-    writer.add_scalar('Loss/std', float(np.std(losses_np)), 0)
-    
-    # 记录动作-状态缓冲区相关的统计信息
-    writer.add_scalar('Config/action_repeat', action_repeat, 0)
-    writer.add_scalar('Config/action_obs_buffer_size', buffer_size, 0)
-    writer.add_scalar('Config/input_dimension', input_dim, 0)
-    writer.add_scalar('Config/effective_actions_per_epoch', env.max_steps_in_episode / action_repeat, 0)
-    writer.add_scalar('Config/auxiliary_loss', 1.0, 0)  # Ver14新增：辅助损失权重
+        
+        # 记录损失统计信息
+        writer.add_scalar('Loss/initial', float(losses_np[0]), 0)
+        writer.add_scalar('Loss/final', float(losses_np[-1]), 0)
+        writer.add_scalar('Loss/min', float(np.min(losses_np)), 0)
+        writer.add_scalar('Loss/max', float(np.max(losses_np)), 0)
+        writer.add_scalar('Loss/mean', float(np.mean(losses_np)), 0)
+        writer.add_scalar('Loss/std', float(np.std(losses_np)), 0)
+        
+        # 记录动作-状态缓冲区相关的统计信息
+        writer.add_scalar('Config/action_repeat', action_repeat, 0)
+        writer.add_scalar('Config/action_obs_buffer_size', buffer_size, 0)
+        writer.add_scalar('Config/input_dimension', input_dim, 0)
+        writer.add_scalar('Config/effective_actions_per_epoch', env.max_steps_in_episode / action_repeat, 0)
+        writer.add_scalar('Config/auxiliary_loss', 0.1, 0)  # Ver14新增：辅助损失权重
+        writer.add_scalar('Config/constraint_max_distance', env.constraint_max_distance, 0)  # Ver15新增
+        writer.add_scalar('Config/constraint_max_velocity', env.constraint_max_velocity, 0)  # Ver15新增
+        
+        # 刷新所有待写入的数据
+        writer.flush()
+        print("✅ TensorBoard数据写入完成")
+    except Exception as e:
+        print(f"⚠️ TensorBoard写入时出现错误（不影响训练结果）: {e}")
+        import traceback
+        traceback.print_exc()
     
     # 获取更新后的训练状态
     train_state = res_dict["runner_state"].train_state
@@ -243,7 +257,7 @@ def main():
     
     # ==================== Print Summary ====================
     print(f"\n{'='*60}")
-    print(f"追踪任务训练完成！(TrackVer14 - 基于Ver13，添加辅助损失，训练50Hz运行的网络)")
+    print(f"追踪任务训练完成！(TrackVer15 - 基于Ver14，添加约束违规检查，训练50Hz运行的网络)")
     print(f"{'='*60}")
     print(f"Training time: {training_time:.2f} seconds ({training_time/60:.2f} minutes)")
     print(f"Final Loss: {final_loss:.6f}")
@@ -254,6 +268,8 @@ def main():
     print(f"Input dimension: {input_dim}")
     print(f"Effective actions per epoch: {env.max_steps_in_episode / action_repeat:.1f}")
     print(f"Network output: action + aux_target_vel (辅助损失)")
+    print(f"Constraint max distance: {env.constraint_max_distance} m")
+    print(f"Constraint max velocity: {env.constraint_max_velocity} m/s")
     print(f"Quadrotor model: Full (Quadrotor - based on agilicious framework)")
     
     
@@ -273,7 +289,7 @@ def main():
             'dt': env.dt,
             'delay': env.delay,
             'action_penalty_weight': env.action_penalty_weight,
-            # Ver14 基于Ver13，添加辅助损失：目标位置y和z随机，roll/pitch±30°随机，yaw完全随机，初始速度0-0.5m/s随机方向，目标速度每episode随机，目标加速度每episode随机（0到最大加速度之间），奖励中加入推力惩罚和辅助损失（目标速度预测）
+            # Ver15 基于Ver14，添加约束违规检查：目标位置y和z随机，roll/pitch±30°随机，yaw完全随机，初始速度0-0.5m/s随机方向，目标速度每episode随机，目标加速度每episode随机（0到最大加速度之间），奖励中加入推力惩罚和辅助损失（目标速度预测），超过距离或速度阈值时reward乘0
             'target_height': env.target_height,
             'target_init_distance_min': env.target_init_distance_min,
             'target_init_distance_max': env.target_init_distance_max,
@@ -281,6 +297,8 @@ def main():
             'target_acceleration_max': env.target_acceleration_max,
             'reset_distance': env.reset_distance,
             'max_speed': env.max_speed,
+            'constraint_max_distance': env.constraint_max_distance,  # Ver15新增
+            'constraint_max_velocity': env.constraint_max_velocity,  # Ver15新增
         }
     }
     
@@ -288,22 +306,35 @@ def main():
     os.makedirs('aquila/param', exist_ok=True)
     
     # 保存为pickle文件
-    checkpoint_path = 'aquila/param/trackVer14_policy.pkl'  # 使用Ver14的文件名
+    checkpoint_path = 'aquila/param/trackVer15_policy.pkl'  # 使用Ver15的文件名
     with open(checkpoint_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"\n✅ Trained tracking policy saved as: {checkpoint_path}")
     
     # 额外保存一个带时间戳的备份
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = f'aquila/param/trackVer14_policy_{timestamp}.pkl'  # 使用Ver14的文件名
+    backup_path = f'aquila/param/trackVer15_policy_{timestamp}.pkl'  # 使用Ver15的文件名
     with open(backup_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"✅ Backup saved as: {backup_path}")
     
-    # 关闭tensorboard writer
-    writer.close()
-    print(f"\n✅ TensorBoard logs saved to: {log_dir}")
-    print(f"   Run 'tensorboard --logdir=runs' to view the results")
+    # 关闭tensorboard writer（添加异常处理）
+    try:
+        # 先刷新所有待写入的数据
+        writer.flush()
+        # 等待一小段时间让后台线程完成写入
+        time.sleep(0.5)
+        # 关闭writer
+        writer.close()
+        print(f"\n✅ TensorBoard logs saved to: {log_dir}")
+        print(f"   Run 'tensorboard --logdir=runs' to view the results")
+    except Exception as e:
+        print(f"⚠️ TensorBoard关闭时出现错误（不影响训练结果）: {e}")
+        # 尝试强制关闭
+        try:
+            writer.close()
+        except:
+            pass
 
 
 if __name__ == "__main__":

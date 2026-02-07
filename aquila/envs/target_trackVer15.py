@@ -1,9 +1,14 @@
 """
-Track Environment Version 14
+Track Environment Version 15
 Full quadrotor tracking environment with a moving target.
-Ver14 modifications: Based on Ver13, adds auxiliary loss for target velocity prediction in body frame.
-The main differences from Ver13:
-- Network now outputs two values: action (4,) and predicted target velocity in body frame (3,)
+Ver15 modifications: Based on Ver14, adds constraint violation checking to prevent gradient updates.
+The main differences from Ver14:
+- Maintains a constraint violation flag that resets each episode
+- If distance or velocity exceeds threshold, multiply reward by 0 to skip gradient update
+- Constraint thresholds: max_distance and max_velocity (configurable)
+
+Ver14 features (inherited):
+- Network outputs two values: action (4,) and predicted target velocity in body frame (3,)
 - Auxiliary loss is added to reward computation for target velocity prediction
 - During deployment to tflite, the C++ code only reads the first output (action), so no changes needed
 
@@ -54,7 +59,7 @@ class ExtendedQuadrotorParams(QuadrotorParams):
 
 
 @jdc.pytree_dataclass
-class TrackStateVer14:
+class TrackStateVer15:
     time: float
     step_idx: int
     quadrotor_state: QuadrotorState
@@ -72,6 +77,8 @@ class TrackStateVer14:
     has_exceeded_distance: bool = False
     # Ver14 new: auxiliary output for target velocity prediction (body frame)
     aux_target_vel_pred: jax.Array = field_jnp(jnp.zeros(3))
+    # Ver15 new: constraint violation flag (resets each episode)
+    has_violated_constraints: bool = False
 
 
 @jax.jit
@@ -97,8 +104,8 @@ def safe_norm(x, eps=1e-8):
     return jnp.sqrt(jnp.sum(x * x) + eps)
 
 
-class TrackEnvVer14(env_base.Env[TrackStateVer14]):
-    """Quadrotor tracking environment Ver14 - based on Ver13, adds auxiliary loss for target velocity prediction."""
+class TrackEnvVer15(env_base.Env[TrackStateVer15]):
+    """Quadrotor tracking environment Ver15 - based on Ver14, adds constraint violation checking."""
     
     def __init__(
         self,
@@ -121,6 +128,9 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
         thrust_to_weight_min=1.2,  # 最小推重比
         thrust_to_weight_max=5.0,  # 最大推重比
         disturbance_mag=2.0,  # [N] 常值扰动力大小（训练时>0，测试时=0）
+        # Ver15 new: constraint thresholds
+        constraint_max_distance=25.0,  # m (最大距离约束，超过则reward乘0)
+        constraint_max_velocity=15.0,  # m/s (最大速度约束，超过则reward乘0)
     ):
         self.world_box = WorldBox(
             jnp.array([-5000.0, -5000.0, -5000.0]), jnp.array([5000.0, 5000.0, 5000.0])
@@ -169,9 +179,13 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
         self.thrust_to_weight_min = thrust_to_weight_min
         self.thrust_to_weight_max = thrust_to_weight_max
         self.disturbance_mag = disturbance_mag
+        
+        # Ver15 new: constraint thresholds
+        self.constraint_max_distance = constraint_max_distance
+        self.constraint_max_velocity = constraint_max_velocity
 
     def reset(
-        self, key: chex.PRNGKey, state: Optional[TrackStateVer14] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
+        self, key: chex.PRNGKey, state: Optional[TrackStateVer15] = None, quad_params: Optional[ExtendedQuadrotorParams] = None):
         """Reset environment with tracking-specific initialization.
         
         Args:
@@ -317,7 +331,7 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
         # Ver14 new: initialize auxiliary output
         aux_target_vel_pred = jax.device_put(jnp.zeros(3))
 
-        state = TrackStateVer14(
+        state = TrackStateVer15(
             time=0.0,
             step_idx=0,
             quadrotor_state=quadrotor_state,
@@ -333,14 +347,15 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
             filtered_thrust=filtered_thrust,
             has_exceeded_distance=False,
             aux_target_vel_pred=aux_target_vel_pred,
+            has_violated_constraints=False,  # Ver15: 初始化约束违规标志
         )
         
         return state, self._get_obs(state)
 
-    def _get_obs(self, state: TrackStateVer14) -> jax.Array:
+    def _get_obs(self, state: TrackStateVer15) -> jax.Array:
         """Get observation from state.
         
-        Ver14修改：继承Ver13，移除观测延迟，直接使用真实状态值
+        Ver15继承：移除观测延迟，直接使用真实状态值
         
         观测组成：
         1. 无人机机体系自身速度向量 (3)
@@ -376,13 +391,15 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _step(
-        self, state: TrackStateVer14, action: jax.Array, key: chex.PRNGKey
+        self, state: TrackStateVer15, action: jax.Array, key: chex.PRNGKey
     ) -> EnvTransition:
         """Execute one step in the environment.
         
-        Ver14修改：action现在是一个包含两个元素的tuple/list:
+        Ver15继承：action现在是一个包含两个元素的tuple/list:
         - action[0]: 实际控制动作 (4,)，范围[-1, 1]
         - action[1]: 辅助输出，目标速度预测（机体系） (3,)
+        
+        Ver15新增：检查距离和速度约束，违规时设置标志
         """
         # Ver14: 解析action和辅助输出
         # 如果action是tuple/list，则第一个是动作，第二个是辅助输出
@@ -484,6 +501,12 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
         distance_to_target = safe_norm(quadrotor_state.p - target_pos, eps=1e-8)
         has_exceeded_distance = state.has_exceeded_distance | (distance_to_target > self.reset_distance)
         
+        # Ver15 new: 检查约束违规（距离和速度）
+        quad_velocity = safe_norm(quadrotor_state.v, eps=1e-8)
+        violated_distance = distance_to_target > self.constraint_max_distance
+        violated_velocity = quad_velocity > self.constraint_max_velocity
+        has_violated_constraints = state.has_violated_constraints | violated_distance | violated_velocity
+        
         next_state = dataclasses.replace(
             state,
             time=state.time + self.dt,
@@ -501,6 +524,7 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
             target_direction=state.target_direction,  # 保持方向不变
             has_exceeded_distance=has_exceeded_distance,
             aux_target_vel_pred=aux_target_vel_pred,  # Ver14: 保存辅助输出
+            has_violated_constraints=has_violated_constraints,  # Ver15: 保存约束违规标志
         )
 
         obs = self._get_obs(next_state)
@@ -530,9 +554,9 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
         )
 
     def _compute_reward(
-        self, last_state: TrackStateVer14, next_state: TrackStateVer14
+        self, last_state: TrackStateVer15, next_state: TrackStateVer15
     ) -> jax.Array:
-        """计算奖励 - 基于Ver13，添加辅助损失（目标速度预测）
+        """计算奖励 - 基于Ver14，添加约束违规检查
         奖励设计：
         1. 方向损失：使用余弦相似度计算完整3D方向（线性）
         2. 距离损失：水平距离与目标距离的绝对差值（线性）
@@ -544,7 +568,7 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
         8. 推力超限损失：动作推力与悬停推力的偏差（线性）
         9. Ver14新增：辅助损失（目标速度预测）- 预测值与真实值的L2距离（线性）
         
-        Ver14修改：添加辅助损失（目标速度在机体系下的预测）
+        Ver15修改：如果违反约束（距离或速度超限），reward乘以0，不参与梯度更新
         """
         # 获取状态信息
         quad_pos = next_state.quadrotor_state.p
@@ -585,9 +609,9 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
         forward_constraint = (1.0 - x_normalized) ** 2
         
         # 权重（可根据需要调整）
-        w_h = 0.0  # 水平偏差权重
+        w_h = 0.05  # 水平偏差权重
         w_v = 0.0  # 垂直偏差权重
-        w_f = 1  # 正面约束权重
+        w_f = 0.1  # 正面约束权重
         
         # 计算总的方向损失
         direction_loss = w_h * horizontal_deviation + w_v * vertical_deviation + w_f * forward_constraint
@@ -682,7 +706,7 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
         # - Ver14新增：辅助损失（目标速度预测），权重为1.0
         total_loss = (
             0.5 * ori_loss +             # 姿态损失：线性增长，权重提高
-            300 * distance_loss +        # 距离损失：零惩罚范围后线性增长，保持较高权重
+            800 * distance_loss +        # 距离损失：零惩罚范围后线性增长，保持较高权重
             3 * velocity_loss +          # 速度损失：零惩罚范围后线性增长
             500 * direction_loss +      # 方向损失：零惩罚范围后线性增长，权重参考Ver13
             50 * height_loss +            # 高度损失：零惩罚范围后线性增长，保持较高权重
@@ -694,6 +718,9 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
         
         # 转换为奖励（负的损失）
         reward = -total_loss
+        
+        # Ver15 new: 如果违反约束，reward乘以0，不参与梯度更新
+        reward = jnp.where(next_state.has_violated_constraints, 0.0, reward)
         
         return reward
 
@@ -722,7 +749,7 @@ class TrackEnvVer14(env_base.Env[TrackStateVer14]):
     def observation_space(self) -> spaces.Box:
         """Get observation space.
         
-        Ver14修改：继承Ver13，移除观测延迟，直接使用真实状态值
+        Ver15继承：移除观测延迟，直接使用真实状态值
         
         观测组成：
         1. 机体系速度 (3)
@@ -749,7 +776,7 @@ if __name__ == "__main__":
     
     key_gen = key_generator(0)
 
-    env = TrackEnvVer14()
+    env = TrackEnvVer15()
 
     state, obs = env.reset(next(key_gen))
     print(f"Initial observation shape: {obs.shape}")
@@ -757,6 +784,7 @@ if __name__ == "__main__":
     print(f"Initial quad position: {state.quadrotor_state.p}")
     print(f"Initial target position: {state.target_pos}")
     print(f"Initial distance: {jnp.linalg.norm(state.quadrotor_state.p - state.target_pos)}")
+    print(f"Initial constraint violation flag: {state.has_violated_constraints}")
     
     # Test with both action formats
     # Format 1: only action (backward compatible)
@@ -768,6 +796,7 @@ if __name__ == "__main__":
     print(f"Reward: {reward}")
     print(f"Distance to target: {info['distance_to_target']}")
     print(f"Terminated: {terminated}")
+    print(f"Has violated constraints: {state.has_violated_constraints}")
     
     # Format 2: action + auxiliary output
     random_action = env.action_space.sample(next(key_gen))
@@ -780,3 +809,4 @@ if __name__ == "__main__":
     print(f"Distance to target: {info['distance_to_target']}")
     print(f"Terminated: {terminated}")
     print(f"Aux output shape: {state.aux_target_vel_pred.shape}")
+    print(f"Has violated constraints: {state.has_violated_constraints}")
