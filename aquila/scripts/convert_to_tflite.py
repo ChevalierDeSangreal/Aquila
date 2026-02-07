@@ -7,6 +7,7 @@
 
 import os
 import sys
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'  # 使用单张GPU
 import pickle
 import numpy as np
 import tensorflow as tf
@@ -31,7 +32,7 @@ def load_flax_params(checkpoint_path):
         final_loss = data.get('final_loss', 'Unknown')
         training_epochs = data.get('training_epochs', 'Unknown')
         action_repeat = data.get('action_repeat', 10)
-        buffer_size = data.get('action_obs_buffer_size', 10)
+        buffer_size = data.get('action_obs_buffer_size', 50)
         input_dimension = data.get('input_dimension', None)
     else:
         params = data
@@ -39,7 +40,7 @@ def load_flax_params(checkpoint_path):
         final_loss = 'Unknown'
         training_epochs = 'Unknown'
         action_repeat = 10
-        buffer_size = 10
+        buffer_size = 50
         input_dimension = None
     
     print("✅ Flax parameters loaded successfully!")
@@ -74,6 +75,12 @@ def extract_mlp_weights(flax_params):
         layer_idx += 1
     
     print(f"✅ Extracted {len(weights)} layers from Flax model")
+    
+    # 推导输出维度（从最后一层的bias维度）
+    if biases:
+        output_dim = len(biases[-1])
+        print(f"   推导的输出维度: {output_dim}")
+    
     return weights, biases
 
 
@@ -261,7 +268,7 @@ def save_model_info(output_dir, input_dim, action_dim, buffer_size, action_repea
     
     with open(info_path, 'w') as f:
         f.write("=" * 60 + "\n")
-        f.write("TrackVer6 TFLite Model Information\n")
+        f.write("TrackVer14 TFLite Model Information\n")
         f.write("=" * 60 + "\n\n")
         
         f.write("模型结构:\n")
@@ -270,9 +277,10 @@ def save_model_info(output_dir, input_dim, action_dim, buffer_size, action_repea
         f.write(f"  隐藏层: [128, 128]\n")
         f.write(f"  激活函数: ReLU (隐藏层), Tanh (输出层)\n\n")
         
-        f.write("缓冲区配置:\n")
+        f.write("缓冲区和动作配置:\n")
         f.write(f"  动作-状态缓冲区大小: {buffer_size}\n")
-        f.write(f"  动作重复: {action_repeat} steps\n\n")
+        f.write(f"  动作重复: {action_repeat} steps\n")
+        f.write(f"  推理频率: {100 // action_repeat} Hz (假设控制100Hz)\n\n")
         
         f.write("环境配置:\n")
         for key, value in env_config.items():
@@ -285,23 +293,30 @@ def save_model_info(output_dir, input_dim, action_dim, buffer_size, action_repea
         f.write("1. 输入格式:\n")
         f.write(f"   - 输入是一个长度为{input_dim}的浮点数数组\n")
         f.write(f"   - 格式: [obs_0 + action_0, obs_1 + action_1, ..., obs_{buffer_size-1} + action_{buffer_size-1}]\n")
-        f.write(f"   - 每个元素包含观测和动作的拼接\n\n")
+        f.write(f"   - 每个元素包含观测和动作的拼接\n")
+        f.write(f"   - 观测维度: 18, 动作维度: {action_dim}\n\n")
         
         f.write("2. 输出格式:\n")
         f.write(f"   - 输出是一个长度为{action_dim}的浮点数数组\n")
-        f.write(f"   - 表示四旋翼的控制指令\n")
+        f.write(f"   - 表示四旋翼的控制指令 [thrust, omega_x, omega_y, omega_z]\n")
         f.write(f"   - 输出范围: [-1, 1] (经过tanh激活)\n\n")
         
         f.write("3. 推理流程:\n")
         f.write(f"   - 维护一个大小为{buffer_size}的动作-状态缓冲区\n")
-        f.write(f"   - 每{action_repeat}个时间步获取一次新动作\n")
+        f.write(f"   - 每{action_repeat}个时间步(共{0.01*action_repeat:.0f}ms)获取一次新动作\n")
         f.write(f"   - 将缓冲区展平为{input_dim}维向量作为网络输入\n")
         f.write(f"   - 网络输出{action_dim}维动作向量\n\n")
         
-        f.write("4. TFLite C++ API使用示例:\n")
+        f.write("4. TrackVer14特点:\n")
+        f.write(f"   - 基于TrackEnvVer13环境\n")
+        f.write(f"   - 使用完整四旋翼模型(agilicious framework)\n")
+        f.write(f"   - 支持参数随机化和常值扰动\n")
+        f.write(f"   - 采样频率: 50Hz (action_repeat=2 @ 100Hz控制)\n\n")
+        
+        f.write("5. TFLite C++ API使用示例:\n")
         f.write("   ```cpp\n")
         f.write("   // 加载模型\n")
-        f.write("   auto model = tflite::FlatBufferModel::BuildFromFile(\"trackVer6_policy.tflite\");\n")
+        f.write("   auto model = tflite::FlatBufferModel::BuildFromFile(\"trackVer14_policyVer0.tflite\");\n")
         f.write("   tflite::ops::builtin::BuiltinOpResolver resolver;\n")
         f.write("   tflite::InterpreterBuilder builder(*model, resolver);\n")
         f.write("   std::unique_ptr<tflite::Interpreter> interpreter;\n")
@@ -309,7 +324,8 @@ def save_model_info(output_dir, input_dim, action_dim, buffer_size, action_repea
         f.write("   interpreter->AllocateTensors();\n\n")
         f.write("   // 准备输入\n")
         f.write(f"   float* input = interpreter->typed_input_tensor<float>(0);\n")
-        f.write(f"   // 填充输入数据 (input[0] 到 input[{input_dim-1}])\n\n")
+        f.write(f"   // 填充输入数据 (input[0] 到 input[{input_dim-1}])\n")
+        f.write(f"   // 缓冲区格式: 前{buffer_size*18}维是观测,后{buffer_size*action_dim}维是动作\n\n")
         f.write("   // 推理\n")
         f.write("   interpreter->Invoke();\n\n")
         f.write("   // 获取输出\n")
@@ -323,14 +339,19 @@ def save_model_info(output_dir, input_dim, action_dim, buffer_size, action_repea
 def main():
     # ==================== 配置 ====================
     # 输入文件路径
-    checkpoint_path = 'aquila/param/hoverVer3_policy.pkl'
+    checkpoint_path = '/home/core/wangzimo/Aquila/aquila/param/trackVer16_policyVer0.pkl'
     
     # 输出文件路径
     output_dir = 'aquila/param/tflite'
-    tflite_path = os.path.join(output_dir, 'hoverVer3_policyVer0.tflite')
+    tflite_path = os.path.join(output_dir, 'trackVer16_policyVer0.tflite')
     
     # 是否启用优化（警告：启用优化可能导致严重的精度损失！）
     optimize = False  # 建议保持 False 以确保模型精度
+    
+    # TrackVer14训练参数（与train_trackVer14.py保持一致）
+    expected_buffer_size = 50
+    expected_action_dim = 4
+    expected_obs_dim = 18
     
     print("=" * 60)
     print("JAX/Flax to TFLite Converter")
@@ -344,29 +365,39 @@ def main():
     
     # 优先从保存的配置中读取，避免创建环境
     action_dim = 4  # 四旋翼控制维度
-    obs_dim = env_config.get('obs_dim', 18)  # TrackEnvVer6默认观测维度
+    obs_dim = env_config.get('obs_dim', 18)  # TrackEnvVer13默认观测维度
+    
+    # 验证buffer_size
+    if buffer_size != expected_buffer_size:
+        print(f"⚠️  警告: checkpoint中的buffer_size ({buffer_size}) 与预期值 ({expected_buffer_size}) 不匹配")
+        print(f"   将使用checkpoint中的值: {buffer_size}")
     
     # 如果配置中没有观测维度，尝试创建环境获取
     if 'obs_dim' not in env_config:
         try:
-            from aquila.envs.target_trackVer6 import TrackEnvVer6
+            from aquila.envs.target_trackVer13 import TrackEnvVer13  # 使用TrackEnvVer13（与train_trackVer14.py一致）
             from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
             
             print("  从环境获取维度信息...")
-            env = TrackEnvVer6(
+            # 环境参数与train_trackVer14.py保持一致
+            env = TrackEnvVer13(
                 max_steps_in_episode=1000,
                 dt=0.01,
                 delay=0.03,
                 omega_std=0.1,
                 action_penalty_weight=0.5,
-                target_height=2.0,
-                target_init_distance_min=0.5,
-                target_init_distance_max=1.5,
-                target_speed_max=1.0,
-                reset_distance=100.0,
-                max_speed=20.0,
-                thrust_to_weight_min=1.5,
-                thrust_to_weight_max=3.0,
+                # Tracking specific parameters
+                target_height=2.0,  # m
+                target_init_distance_min=0.5,  # m
+                target_init_distance_max=1.5,  # m
+                target_speed_max=2.0,  # m/s
+                target_acceleration_max=1,  # m/s²
+                reset_distance=100.0,  # m
+                max_speed=20.0,  # m/s
+                # Parameter randomization (quadrotor)
+                thrust_to_weight_min=1.2,
+                thrust_to_weight_max=5.0,
+                disturbance_mag=2.0,
             )
             env = MinMaxObservationWrapper(env)
             env = NormalizeActionWrapper(env)
@@ -374,8 +405,10 @@ def main():
             action_dim = env.action_space.shape[0]
             obs_dim = env.observation_space.shape[0]
         except ImportError as e:
-            print(f"  ⚠️  无法导入环境模块: {e}")
+            print(f"  ⚠️  无法导入TrackEnvVer13环境模块: {e}")
             print(f"  使用默认维度: obs_dim={obs_dim}, action_dim={action_dim}")
+    else:
+        obs_dim = env_config.get('obs_dim', obs_dim)
     
     # 计算输入维度
     if input_dimension is None:
@@ -386,11 +419,21 @@ def main():
     print(f"  观测维度: {obs_dim}")
     print(f"  动作维度: {action_dim}")
     print(f"  缓冲区大小: {buffer_size}")
+    print(f"  动作重复: {action_repeat}")
     print(f"  输入维度: {input_dim}")
     
     # ==================== 提取Flax权重 ====================
     print("\n提取Flax模型权重...")
     weights, biases = extract_mlp_weights(flax_params)
+    
+    # 从权重中推导实际的输出维度（重要：可能与env.action_space不同）
+    # 最后一层bias的维度就是输出维度
+    actual_output_dim = len(biases[-1])
+    print(f"\n✅ 从权重推导的实际输出维度: {actual_output_dim}")
+    if actual_output_dim != action_dim:
+        print(f"⚠️  警告: 预期输出维度({action_dim}) ≠ 实际输出维度({actual_output_dim})")
+        print(f"   将使用实际维度({actual_output_dim})进行转换")
+        action_dim = actual_output_dim
     
     # ==================== 创建TensorFlow模型 ====================
     print("\n创建TensorFlow模型...")
@@ -419,10 +462,11 @@ def main():
     print("=" * 60)
     print(f"TFLite模型路径: {tflite_path}")
     print(f"模型信息文件: {os.path.join(output_dir, 'model_info.txt')}")
-    print(f"输入维度: {input_dim}")
+    print(f"输入维度: {input_dim} (buffer_size={buffer_size} × (obs_dim={obs_dim} + action_dim={action_dim}))")
     print(f"输出维度: {action_dim}")
+    print(f"动作重复: {action_repeat} steps")
     print(f"优化: {'启用' if optimize else '禁用'}")
-    print("\n模型已准备好用于C++部署！")
+    print("\nTrackVer14模型已准备好用于C++部署！")
     print("=" * 60)
 
 
