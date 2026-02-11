@@ -1,16 +1,14 @@
 """
-Track Environment Version 16
+Track Environment Version 17
 Full quadrotor tracking environment with a moving target.
-Ver16 modifications: Based on Ver15, adds circular trajectory support for validation.
-The main differences from Ver15:
-- Adds circular trajectory mode for validation (matching RealFlight target_publisher_node)
-- Supports both random target motion (training) and circular trajectory (validation)
-- Circular trajectory parameters: center, radius, angular velocity, initial phase
-- **Ver16 enhanced**: Training mode now supports mixed trajectories (直线 + 圆周运动)
-  * 训练时随机选择直线运动或圆周运动（50%概率）
-  * 圆周运动参数随机化：半径(0.5-3.0m)、圆心位置、最大速度、加速度
-  * 圆周运动从0加速到最大速度，支持不同大小和速度的圆周轨迹
-  * 直线运动保持原有逻辑：随机方向、从0加速到最大速度
+Ver17 modifications: Based on Ver16, simplifies to only linear trajectory with new dynamics.
+The main differences from Ver16:
+- **Ver17 new**: Target linear motion uses acceleration-deceleration profile + constant random perturbation
+  * 目标物体先加速后减速（周期性运动）
+  * 叠加一个随机方向和大小的恒定加速度扰动
+  * 限制目标物体最大速度，达到最大速度后加速度只改变方向不改变大小
+  * 更真实的目标运动模型，提高追踪难度
+- **Ver17 simplified**: Removed circular trajectory support for cleaner code
 
 Ver15 features (inherited):
 - Maintains a constraint violation flag that resets each episode
@@ -69,7 +67,7 @@ class ExtendedQuadrotorParams(QuadrotorParams):
 
 
 @jdc.pytree_dataclass
-class TrackStateVer16:
+class TrackStateVer17:
     time: float
     step_idx: int
     quadrotor_state: QuadrotorState
@@ -89,14 +87,10 @@ class TrackStateVer16:
     aux_target_vel_pred: jax.Array = field_jnp(jnp.zeros(3))
     # Ver15 new: constraint violation flag (resets each episode)
     has_violated_constraints: bool = False
-    # Ver16 new: circular trajectory mode
-    use_circular_trajectory: bool = False  # 是否使用圆形轨迹
-    circular_center: jax.Array = field_jnp(jnp.zeros(3))  # 圆心位置（NED坐标系）
-    circular_radius: float = 2.0  # 圆形轨迹半径
-    circular_angular_vel: float = 0.5  # 圆形轨迹角速度（rad/s）
-    circular_init_phase: float = 0.0  # 圆形轨迹初始相位（rad）
-    # Ver16 enhanced: training trajectory mode (0=直线运动, 1=圆周运动)
-    training_trajectory_mode: int = 0  # 训练时的轨迹类型
+    # Ver17 new: acceleration-deceleration profile for linear motion
+    target_accel_period: float = 10.0  # 加减速周期（秒）
+    target_accel_amplitude: float = 1.0  # 加减速幅度（m/s²）
+    target_perturbation_acc: jax.Array = field_jnp(jnp.zeros(3))  # 随机恒定扰动加速度（m/s²）
 
 
 @jax.jit
@@ -122,8 +116,8 @@ def safe_norm(x, eps=1e-8):
     return jnp.sqrt(jnp.sum(x * x) + eps)
 
 
-class TrackEnvVer16(env_base.Env[TrackStateVer16]):
-    """Quadrotor tracking environment Ver16 - based on Ver15, adds circular trajectory support for validation."""
+class TrackEnvVer17(env_base.Env[TrackStateVer17]):
+    """Quadrotor tracking environment Ver17 - based on Ver16, changes linear trajectory dynamics."""
     
     def __init__(
         self,
@@ -203,12 +197,7 @@ class TrackEnvVer16(env_base.Env[TrackStateVer16]):
         self.constraint_max_velocity = constraint_max_velocity
 
     def reset(
-        self, key: chex.PRNGKey, state: Optional[TrackStateVer16] = None, quad_params: Optional[ExtendedQuadrotorParams] = None,
-        use_circular_trajectory: bool = False,  # Ver16: 是否使用圆形轨迹
-        circular_center: Optional[jax.Array] = None,  # Ver16: 圆心位置
-        circular_radius: float = 2.0,  # Ver16: 圆形轨迹半径
-        circular_angular_vel: float = 0.5,  # Ver16: 圆形轨迹角速度
-        circular_init_phase: float = 0.0,  # Ver16: 圆形轨迹初始相位
+        self, key: chex.PRNGKey, state: Optional[TrackStateVer17] = None, quad_params: Optional[ExtendedQuadrotorParams] = None
     ):
         """Reset environment with tracking-specific initialization.
         
@@ -216,18 +205,14 @@ class TrackEnvVer16(env_base.Env[TrackStateVer16]):
             key: Random key for initialization
             state: Optional state to reset to
             quad_params: Optional quadrotor parameters. If None, will use default or randomize based on key.
-            use_circular_trajectory: Ver16新增，是否使用圆形轨迹（验证模式）
-            circular_center: Ver16新增，圆心位置（NED坐标系），如果None则使用默认值[0, 0, -2]
-            circular_radius: Ver16新增，圆形轨迹半径（米）
-            circular_angular_vel: Ver16新增，圆形轨迹角速度（rad/s）
-            circular_init_phase: Ver16新增，圆形轨迹初始相位（rad）
         """
         if state is not None:
             return state, self._get_obs(state)
         
         # 分割随机数key
-        keys = jax.random.split(key, 16)
-        key_target_x, key_target_y, key_target_z, key_target_dir, key_target_speed, key_target_acc, key_roll, key_pitch, key_yaw, key_omega, key_quad, key_randomize, key_vel_dir, key_vel_mag, key_trajectory_mode, key_circle_params = keys
+        keys = jax.random.split(key, 14)
+        key_target_x, key_target_y, key_target_z, key_target_dir, key_target_speed, key_roll, key_pitch, key_yaw, key_omega, key_quad, key_randomize, key_vel_dir, key_vel_mag, key_accel_params = keys
+        accel_keys = jax.random.split(key_accel_params, 3)
         
         # 获取quadrotor参数（如果没有提供则使用默认参数）
         if quad_params is None:
@@ -253,163 +238,67 @@ class TrackEnvVer16(env_base.Env[TrackStateVer16]):
                 gravity=9.81
             )
         
-        # ========== 目标物体初始化 ==========
-        if use_circular_trajectory:
-            # Ver16: 圆形轨迹模式（验证模式）
-            # 设置圆心位置
-            if circular_center is None:
-                # 默认圆心在[0, 0, -2]（ENU转NED: [0, 0, 1.2] -> [0, 0, -1.2]，但实际用-2更合适）
-                center_pos = jnp.array([0.0, 0.0, -self.target_height])
-            else:
-                center_pos = circular_center
-            
-            # 初始目标位置在圆上（根据初始相位）
-            target_x = center_pos[0] + circular_radius * jnp.cos(circular_init_phase)
-            target_y = center_pos[1] + circular_radius * jnp.sin(circular_init_phase)
-            target_z = center_pos[2]
-            target_pos = jnp.array([target_x, target_y, target_z])
-            
-            # 圆形运动的初始速度（切向速度）
-            # 速度方向与半径方向垂直，大小为 v = ω * r
-            v_tangential = circular_angular_vel * circular_radius
-            target_vel = jnp.array([
-                -v_tangential * jnp.sin(circular_init_phase),
-                v_tangential * jnp.cos(circular_init_phase),
-                0.0
-            ])
-            
-            # 圆形轨迹模式不需要随机方向
-            target_direction = jnp.array([1.0, 0.0, 0.0])  # 占位符
-            
-            # 圆形轨迹模式使用固定速度
-            episode_target_speed_max = v_tangential
-            episode_target_acceleration = 0.0  # 圆形轨迹不需要加速度
-            
-            training_trajectory_mode = 0  # 验证模式不使用
-        else:
-            # 训练模式：随机选择直线运动或圆周运动
-            # 0 = 直线运动, 1 = 圆周运动
-            training_trajectory_mode = jax.random.choice(key_trajectory_mode, jnp.array([0, 1]))
-            
-            # 使用 jax.lax.cond 根据轨迹模式初始化
-            def init_linear_motion(_):
-                """初始化直线运动模式"""
-                # x正半轴上0.5～1.5m处
-                target_x = jax.random.uniform(
-                    key_target_x, shape=(), 
-                    minval=self.target_init_distance_min, 
-                    maxval=self.target_init_distance_max
-                )
-                # y在(-0.2, 0.2)范围内随机
-                target_y = jax.random.uniform(
-                    key_target_y, shape=(),
-                    minval=-0.2,
-                    maxval=0.2
-                )
-                # z在(-2.2, -1.8)范围内随机 (NED坐标系，高度在天上所以是负值)
-                target_z = jax.random.uniform(
-                    key_target_z, shape=(),
-                    minval=-2.2,
-                    maxval=-1.8
-                )
-                target_pos = jnp.array([target_x, target_y, target_z])
-                
-                # 随机生成速度方向（单位向量，任意方向）
-                random_vec = jax.random.normal(key_target_dir, shape=(3,))
-                target_direction = random_vec / jnp.linalg.norm(random_vec)
-                
-                # 每次episode随机化目标最大速度（0到target_speed_max之间）
-                episode_target_speed_max = jax.random.uniform(
-                    key_target_speed, shape=(),
-                    minval=0.0,
-                    maxval=self.target_speed_max
-                )
-                
-                # 每次episode随机化目标加速度（0到最大加速度之间）
-                episode_target_acceleration = jax.random.uniform(
-                    key_target_acc, shape=(),
-                    minval=0.0,
-                    maxval=self.target_acceleration_max
-                )
-                
-                # 初始速度为0，将加速到episode的目标最大速度（沿随机方向）
-                target_vel = jnp.array([0.0, 0.0, 0.0])
-                
-                # 圆周运动参数（直线模式不使用，设置默认值）
-                center_pos = jnp.array([0.0, 0.0, -self.target_height])
-                radius = 2.0
-                angular_vel = 0.5
-                init_phase = 0.0
-                
-                return target_pos, target_vel, target_direction, episode_target_speed_max, episode_target_acceleration, center_pos, radius, angular_vel, init_phase
-            
-            def init_circular_motion(_):
-                """初始化圆周运动模式"""
-                # 圆心位置：在无人机附近随机偏移
-                circle_keys = jax.random.split(key_circle_params, 6)  # 增加一个key用于方向选择
-                center_x = jax.random.uniform(circle_keys[0], shape=(), minval=-1.0, maxval=1.0)
-                center_y = jax.random.uniform(circle_keys[1], shape=(), minval=-1.0, maxval=1.0)
-                center_z = jax.random.uniform(circle_keys[2], shape=(), minval=-2.2, maxval=-1.8)
-                center_pos = jnp.array([center_x, center_y, center_z])
-                
-                # 随机半径（0.5到3.0米）
-                radius = jax.random.uniform(circle_keys[3], shape=(), minval=0.5, maxval=3.0)
-                
-                # 随机初始相位
-                init_phase = jax.random.uniform(circle_keys[4], shape=(), minval=0.0, maxval=2.0*jnp.pi)
-                
-                # 随机选择旋转方向（顺时针或逆时针）
-                # 0 = 逆时针（角速度为正）, 1 = 顺时针（角速度为负）
-                direction_choice = jax.random.choice(circle_keys[5], jnp.array([1.0, -1.0]))
-                
-                # 初始目标位置在圆上
-                target_x = center_pos[0] + radius * jnp.cos(init_phase)
-                target_y = center_pos[1] + radius * jnp.sin(init_phase)
-                target_z = center_pos[2]
-                target_pos = jnp.array([target_x, target_y, target_z])
-                
-                # 随机目标最大速度（0到target_speed_max之间）
-                episode_target_speed_max = jax.random.uniform(
-                    key_target_speed, shape=(),
-                    minval=0.0,
-                    maxval=self.target_speed_max
-                )
-                
-                # 圆周运动的加速度（用于从0加速到最大速度）
-                episode_target_acceleration = jax.random.uniform(
-                    key_target_acc, shape=(),
-                    minval=0.0,
-                    maxval=self.target_acceleration_max
-                )
-                
-                # 初始速度为0（将加速）
-                target_vel = jnp.array([0.0, 0.0, 0.0])
-                
-                # 切向速度方向（初始），考虑旋转方向
-                target_direction = jnp.array([
-                    -direction_choice * jnp.sin(init_phase),
-                    direction_choice * jnp.cos(init_phase),
-                    0.0
-                ])
-                
-                # 根据最大速度计算目标角速度: v_max = |ω| * r, ω = ±v_max / r
-                # 角速度的符号由 direction_choice 决定
-                angular_vel = direction_choice * episode_target_speed_max / (radius + 1e-8)
-                
-                return target_pos, target_vel, target_direction, episode_target_speed_max, episode_target_acceleration, center_pos, radius, angular_vel, init_phase
-            
-            # 根据 training_trajectory_mode 选择初始化方式
-            target_pos, target_vel, target_direction, episode_target_speed_max, episode_target_acceleration, center_pos, radius, angular_vel, init_phase = jax.lax.cond(
-                training_trajectory_mode == 0,
-                init_linear_motion,
-                init_circular_motion,
-                operand=None
-            )
-            
-            # 更新圆周运动参数
-            circular_radius = radius
-            circular_angular_vel = angular_vel
-            circular_init_phase = init_phase
+        # ========== 目标物体初始化（Ver17：只支持加减速直线运动） ==========
+        # x正半轴上0.5～1.5m处
+        target_x = jax.random.uniform(
+            key_target_x, shape=(), 
+            minval=self.target_init_distance_min, 
+            maxval=self.target_init_distance_max
+        )
+        # y在(-0.2, 0.2)范围内随机
+        target_y = jax.random.uniform(
+            key_target_y, shape=(),
+            minval=-0.2,
+            maxval=0.2
+        )
+        # z在(-2.2, -1.8)范围内随机 (NED坐标系，高度在天上所以是负值)
+        target_z = jax.random.uniform(
+            key_target_z, shape=(),
+            minval=-2.2,
+            maxval=-1.8
+        )
+        target_pos = jnp.array([target_x, target_y, target_z])
+        
+        # 随机生成速度方向（单位向量，任意方向）
+        random_vec = jax.random.normal(key_target_dir, shape=(3,))
+        target_direction = random_vec / jnp.linalg.norm(random_vec)
+        
+        # 每次episode随机化目标最大速度（0到target_speed_max之间）
+        episode_target_speed_max = jax.random.uniform(
+            key_target_speed, shape=(),
+            minval=0.0,
+            maxval=self.target_speed_max
+        )
+        
+        # Ver17: 加减速周期（1到10秒之间随机）
+        accel_period = jax.random.uniform(
+            accel_keys[0], shape=(),
+            minval=1.0,
+            maxval=10.0
+        )
+        
+        # Ver17: 加减速幅度（0到最大加速度之间）
+        accel_amplitude = jax.random.uniform(
+            accel_keys[1], shape=(),
+            minval=0.0,
+            maxval=self.target_acceleration_max
+        )
+        
+        # Ver17: 随机恒定扰动加速度
+        # 随机方向
+        perturb_keys = jax.random.split(accel_keys[2], 2)
+        perturb_dir = jax.random.normal(perturb_keys[0], shape=(3,))
+        perturb_dir = perturb_dir / (jnp.linalg.norm(perturb_dir) + 1e-8)
+        # 随机大小（0到最大加速度的50%之间）
+        perturb_mag = jax.random.uniform(
+            perturb_keys[1], shape=(),
+            minval=0.0,
+            maxval=self.target_acceleration_max * 0.5
+        )
+        perturbation_acc = perturb_dir * perturb_mag
+        
+        # 初始速度为0
+        target_vel = jnp.array([0.0, 0.0, 0.0])
         
         # ========== 无人机初始化 ==========
         # 位置在原点，高度为2m（NED坐标系中z=-2）
@@ -474,7 +363,7 @@ class TrackEnvVer16(env_base.Env[TrackStateVer16]):
         # Ver14 new: initialize auxiliary output
         aux_target_vel_pred = jax.device_put(jnp.zeros(3))
 
-        state = TrackStateVer16(
+        state = TrackStateVer17(
             time=0.0,
             step_idx=0,
             quadrotor_state=quadrotor_state,
@@ -484,24 +373,21 @@ class TrackEnvVer16(env_base.Env[TrackStateVer16]):
             target_direction=target_direction,
             quad_params=quad_params,
             target_speed_max=episode_target_speed_max,
-            target_acceleration=episode_target_acceleration,
+            target_acceleration=accel_amplitude,  # Ver17: 使用加减速幅度
             action_raw=action_raw,
             filtered_acc=filtered_acc,
             filtered_thrust=filtered_thrust,
             has_exceeded_distance=False,
             aux_target_vel_pred=aux_target_vel_pred,
             has_violated_constraints=False,  # Ver15: 初始化约束违规标志
-            use_circular_trajectory=use_circular_trajectory,  # Ver16: 圆形轨迹标志
-            circular_center=center_pos,  # Ver16: 圆心位置
-            circular_radius=circular_radius,  # Ver16: 圆形轨迹半径
-            circular_angular_vel=circular_angular_vel,  # Ver16: 圆形轨迹角速度
-            circular_init_phase=circular_init_phase,  # Ver16: 圆形轨迹初始相位
-            training_trajectory_mode=training_trajectory_mode,  # Ver16 enhanced: 训练轨迹模式
+            target_accel_period=accel_period,  # Ver17: 加减速周期
+            target_accel_amplitude=accel_amplitude,  # Ver17: 加减速幅度
+            target_perturbation_acc=perturbation_acc,  # Ver17: 随机恒定扰动加速度
         )
         
         return state, self._get_obs(state)
 
-    def _get_obs(self, state: TrackStateVer16) -> jax.Array:
+    def _get_obs(self, state: TrackStateVer17) -> jax.Array:
         """Get observation from state.
         
         Ver16继承：移除观测延迟，直接使用真实状态值
@@ -540,15 +426,15 @@ class TrackEnvVer16(env_base.Env[TrackStateVer16]):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _step(
-        self, state: TrackStateVer16, action: jax.Array, key: chex.PRNGKey
+        self, state: TrackStateVer17, action: jax.Array, key: chex.PRNGKey
     ) -> EnvTransition:
         """Execute one step in the environment.
         
-        Ver16继承：action现在是一个包含两个元素的tuple/list:
+        Ver17继承：action现在是一个包含两个元素的tuple/list:
         - action[0]: 实际控制动作 (4,)，范围[-1, 1]
         - action[1]: 辅助输出，目标速度预测（机体系） (3,)
         
-        Ver16新增：支持圆形轨迹模式
+        Ver17新增：只支持加减速直线运动 + 随机恒定扰动加速度
         """
         # Ver14: 解析action和辅助输出
         # 如果action是tuple/list，则第一个是动作，第二个是辅助输出
@@ -631,108 +517,38 @@ class TrackEnvVer16(env_base.Env[TrackStateVer16]):
         filtered_acc = first_order_filter(specific_force, state.filtered_acc, alpha_acc)
         filtered_thrust = first_order_filter(action_1[0], state.filtered_thrust, alpha_thrust)
 
-        # Ver16: 目标物体运动（支持圆形轨迹和随机运动两种模式）
-        # 使用 jax.lax.cond 而不是 Python if-else，以支持 JIT 编译
+        # Ver17: 目标物体运动（加减速直线运动 + 随机恒定扰动）
+        current_vel = state.target_vel
+        current_speed = safe_norm(current_vel, eps=1e-8)
+        episode_target_speed_max = state.target_speed_max
         
-        def circular_trajectory_fn(_):
-            """圆形轨迹模式"""
-            # 计算当前角度：θ(t) = θ0 + ω * t
-            current_theta = state.circular_init_phase + state.circular_angular_vel * state.time
-            
-            # 计算新位置（圆上的点）
-            new_target_pos = jnp.array([
-                state.circular_center[0] + state.circular_radius * jnp.cos(current_theta + state.circular_angular_vel * self.dt),
-                state.circular_center[1] + state.circular_radius * jnp.sin(current_theta + state.circular_angular_vel * self.dt),
-                state.circular_center[2]
-            ])
-            
-            # 计算新速度（切向速度）
-            v_tangential = state.circular_angular_vel * state.circular_radius
-            new_target_vel = jnp.array([
-                -v_tangential * jnp.sin(current_theta + state.circular_angular_vel * self.dt),
-                v_tangential * jnp.cos(current_theta + state.circular_angular_vel * self.dt),
-                0.0
-            ])
-            
-            return new_target_pos, new_target_vel
+        # 1. 计算加减速分量：a(t) = A * sin(2π * t / T)
+        #    其中 A 是加速度幅度，T 是周期
+        accel_phase = 2.0 * jnp.pi * state.time / state.target_accel_period
+        accel_component = state.target_accel_amplitude * jnp.sin(accel_phase)
         
-        def random_trajectory_fn(_):
-            """原始随机运动模式（根据 training_trajectory_mode 选择直线或圆周）"""
-            # 判断是直线运动还是圆周运动
-            def linear_motion_fn(_):
-                """直线运动：从0加速到当前episode的最大速度，沿随机方向"""
-                current_speed_vec = state.target_vel
-                current_speed = safe_norm(current_speed_vec, eps=1e-8)
-                episode_target_speed_max = state.target_speed_max
-                episode_target_acceleration = state.target_acceleration
-                
-                # 如果当前速度小于最大速度，则加速
-                new_speed = jnp.minimum(
-                    current_speed + episode_target_acceleration * self.dt,
-                    episode_target_speed_max
-                )
-                # 速度向量 = 速度大小 * 方向单位向量
-                new_target_vel = new_speed * state.target_direction
-                new_target_pos = state.target_pos + new_target_vel * self.dt
-                
-                return new_target_pos, new_target_vel
-            
-            def circular_motion_training_fn(_):
-                """圆周运动（训练模式）：从0加速到最大速度，沿圆周切向运动"""
-                current_speed_vec = state.target_vel
-                current_speed = safe_norm(current_speed_vec, eps=1e-8)
-                episode_target_speed_max = state.target_speed_max
-                episode_target_acceleration = state.target_acceleration
-                
-                # 如果当前速度小于最大速度，则加速
-                new_speed = jnp.minimum(
-                    current_speed + episode_target_acceleration * self.dt,
-                    episode_target_speed_max
-                )
-                
-                # 计算当前相对于圆心的角度
-                rel_pos = state.target_pos - state.circular_center
-                current_theta = jnp.arctan2(rel_pos[1], rel_pos[0])
-                
-                # 根据当前速度和半径计算角速度: ω = v / r
-                # 保持初始角速度的方向（通过 state.circular_angular_vel 的符号）
-                angular_vel_direction = jnp.sign(state.circular_angular_vel)
-                current_angular_vel = angular_vel_direction * new_speed / (state.circular_radius + 1e-8)
-                
-                # 计算新角度
-                new_theta = current_theta + current_angular_vel * self.dt
-                
-                # 计算新位置（圆上的点）
-                new_target_pos = jnp.array([
-                    state.circular_center[0] + state.circular_radius * jnp.cos(new_theta),
-                    state.circular_center[1] + state.circular_radius * jnp.sin(new_theta),
-                    state.circular_center[2]
-                ])
-                
-                # 计算新速度（切向速度），考虑旋转方向
-                new_target_vel = jnp.array([
-                    -angular_vel_direction * new_speed * jnp.sin(new_theta),
-                    angular_vel_direction * new_speed * jnp.cos(new_theta),
-                    0.0
-                ])
-                
-                return new_target_pos, new_target_vel
-            
-            # 根据 training_trajectory_mode 选择运动模式
-            return jax.lax.cond(
-                state.training_trajectory_mode == 0,
-                linear_motion_fn,
-                circular_motion_training_fn,
-                operand=None
+        # 2. 加上随机恒定扰动加速度
+        total_accel = accel_component * state.target_direction + state.target_perturbation_acc
+        
+        # 3. 更新速度
+        new_vel = current_vel + total_accel * self.dt
+        new_speed = safe_norm(new_vel, eps=1e-8)
+        
+        # 4. 限制最大速度：达到最大速度后，加速度只改变方向不改变大小
+        def limit_velocity(vel, speed, max_speed):
+            """限制速度的辅助函数"""
+            # 如果超过最大速度，将速度投影到当前方向并限制大小
+            return jnp.where(
+                speed > max_speed,
+                vel * (max_speed / (speed + 1e-8)),  # 保持方向，限制大小
+                vel  # 未超过则保持原值
             )
         
-        # 使用 jax.lax.cond 根据 use_circular_trajectory 选择轨迹模式
-        target_pos, target_vel = jax.lax.cond(
-            state.use_circular_trajectory,
-            circular_trajectory_fn,
-            random_trajectory_fn,
-            operand=None
-        )
+        new_vel_limited = limit_velocity(new_vel, new_speed, episode_target_speed_max)
+        
+        # 5. 更新位置
+        target_pos = state.target_pos + new_vel_limited * self.dt
+        target_vel = new_vel_limited
         
         # 检查距离是否超过reset_distance，更新标志位
         distance_to_target = safe_norm(quadrotor_state.p - target_pos, eps=1e-8)
@@ -762,6 +578,9 @@ class TrackEnvVer16(env_base.Env[TrackStateVer16]):
             has_exceeded_distance=has_exceeded_distance,
             aux_target_vel_pred=aux_target_vel_pred,  # Ver14: 保存辅助输出
             has_violated_constraints=has_violated_constraints,  # Ver15: 保存约束违规标志
+            target_accel_period=state.target_accel_period,  # Ver17: 保持加减速周期不变
+            target_accel_amplitude=state.target_accel_amplitude,  # Ver17: 保持加减速幅度不变
+            target_perturbation_acc=state.target_perturbation_acc,  # Ver17: 保持扰动加速度不变
         )
 
         obs = self._get_obs(next_state)
@@ -791,7 +610,7 @@ class TrackEnvVer16(env_base.Env[TrackStateVer16]):
         )
 
     def _compute_reward(
-        self, last_state: TrackStateVer16, next_state: TrackStateVer16
+        self, last_state: TrackStateVer17, next_state: TrackStateVer17
     ) -> jax.Array:
         """计算奖励 - 基于Ver14，添加约束违规检查
         奖励设计：
@@ -1013,7 +832,7 @@ if __name__ == "__main__":
     
     key_gen = key_generator(0)
 
-    env = TrackEnvVer16()
+    env = TrackEnvVer17()
 
     state, obs = env.reset(next(key_gen))
     print(f"Initial observation shape: {obs.shape}")
@@ -1022,7 +841,9 @@ if __name__ == "__main__":
     print(f"Initial target position: {state.target_pos}")
     print(f"Initial distance: {jnp.linalg.norm(state.quadrotor_state.p - state.target_pos)}")
     print(f"Initial constraint violation flag: {state.has_violated_constraints}")
-    print(f"Use circular trajectory: {state.use_circular_trajectory}")
+    print(f"Ver17 - Accel period: {state.target_accel_period}")
+    print(f"Ver17 - Accel amplitude: {state.target_accel_amplitude}")
+    print(f"Ver17 - Perturbation acc: {state.target_perturbation_acc}")
     
     # Test with both action formats
     # Format 1: only action (backward compatible)
@@ -1049,21 +870,13 @@ if __name__ == "__main__":
     print(f"Aux output shape: {state.aux_target_vel_pred.shape}")
     print(f"Has violated constraints: {state.has_violated_constraints}")
     
-    # Test circular trajectory mode
+    # Test multiple steps to see target motion
     print(f"\n{'='*60}")
-    print("Testing circular trajectory mode (validation):")
+    print("Testing target motion over multiple steps:")
     print(f"{'='*60}")
-    state, obs = env.reset(
-        next(key_gen),
-        use_circular_trajectory=True,
-        circular_center=jnp.array([0.0, 0.0, -2.0]),
-        circular_radius=2.0,
-        circular_angular_vel=0.5,
-        circular_init_phase=0.0
-    )
-    print(f"Initial position: {state.target_pos}")
-    print(f"Initial velocity: {state.target_vel}")
-    print(f"Use circular trajectory: {state.use_circular_trajectory}")
-    print(f"Circular center: {state.circular_center}")
-    print(f"Circular radius: {state.circular_radius}")
-    print(f"Circular angular velocity: {state.circular_angular_vel}")
+    state, obs = env.reset(next(key_gen))
+    for i in range(10):
+        random_action = env.action_space.sample(next(key_gen))
+        transition = env.step(state, random_action, next(key_gen))
+        state, obs, reward, terminated, truncated, info = transition
+        print(f"Step {i+1}: Target pos={state.target_pos}, Target vel={state.target_vel}, Speed={jnp.linalg.norm(state.target_vel):.3f}")

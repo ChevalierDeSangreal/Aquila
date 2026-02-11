@@ -6,7 +6,7 @@ import sys
 
 # ==================== GPU Configuration ====================
 # 必须在导入JAX之前设置CUDA_VISIBLE_DEVICES
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # 使用单张GPU
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'  # 使用单张GPU
 os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/usr/local/cuda'
 
 import time
@@ -25,17 +25,22 @@ from flax import linen as nn
 # aquila/scripts/train_trackVer14.py -> ../../ -> Aquila project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from aquila.envs.target_trackVer16 import TrackEnvVer16  # 使用TrackEnvVer16（基于Ver15，添加圆形轨迹支持）
+from aquila.envs.target_trackVer17 import TrackEnvVer17  # 使用TrackEnvVer17（基于Ver16，修改目标运动逻辑）
 from aquila.envs.wrappers import MinMaxObservationWrapper, NormalizeActionWrapper
 from aquila.modules.mlp import MLP
 from aquila.algos import bpttVer2
 
 """
-TrackVer16: 基于Ver15，添加圆形轨迹支持
+TrackVer17: 基于Ver16，修改目标物体运动逻辑并简化代码
 - action_repeat = 2 (每2个step才获取一次新动作，每秒50次动作，每次持续0.02秒)
 - buffer_size = 50 (动作-状态缓冲区大小)
 - 网络输出：动作 (4,) + 辅助输出 (3,) = 目标速度预测（机体系）
 - 辅助损失：预测值与真实值的L2距离，权重为1.0
+- **Ver17新增**：目标物体运动模式改变
+  * 直线运动：加减速 (正弦函数) + 随机恒定扰动加速度
+  * 速度限制：达到最大速度后加速度只改变方向不改变大小
+  * 更真实的目标运动，提高追踪难度和鲁棒性
+- **Ver17简化**：删除圆周运动和验证环境支持，专注于训练
 - 使用 bpttVer2 (scan 实现)
 """
 
@@ -72,8 +77,8 @@ def main():
     print(f"JAX device count: {jax.device_count()}")
     
     # ==================== Environment Setup ====================
-    # Create env - 使用TrackEnvVer16环境（基于Ver15，添加圆形轨迹支持），训练50Hz网络
-    env = TrackEnvVer16(
+    # Create env - 使用TrackEnvVer17环境（基于Ver16，修改目标运动逻辑），训练50Hz网络
+    env = TrackEnvVer17(
         max_steps_in_episode=600,  # 追踪任务的最大步数
         dt=0.01,  # 使用完整四旋翼的默认时间步长
         delay=0.03,  # 可选执行延迟
@@ -105,7 +110,7 @@ def main():
     input_dim = buffer_size * (obs_dim + action_dim)  # 输入维度为缓冲区大小乘以(观测维度+动作维度)
     
     # 创建策略网络，输出7维：action (4,) + aux_output (3,)
-    # 使用MLP直接输出7维，然后在bpttVer3中分割成 (action, aux_output)
+    # 使用MLP直接输出7维，然后在bpttVer2中分割成 (action, aux_output)
     output_dim = action_dim + 3  # 4个动作 + 3个辅助输出
     policy = MLP([input_dim, 128, 128, output_dim], initial_scale=0.2)
     
@@ -123,8 +128,8 @@ def main():
     action_repeat = 2  # 每2个step才获取一次新动作（每秒50次动作，每次持续0.02秒）
     
     # Optimizer - 使用余弦衰减学习率
-    initial_learning_rate = 5e-3
-    end_learning_rate = 1e-4
+    initial_learning_rate = 1e-3
+    end_learning_rate = 1e-6
     scheduler = optax.cosine_decay_schedule(
         init_value=initial_learning_rate,
         decay_steps=num_epochs,
@@ -152,7 +157,7 @@ def main():
         print("✅ 使用初始网络参数开始训练")
     else:
         # 使用加载的参数
-        policy_file = 'aquila/param/trackVer16_policy.pkl'  # 使用Ver16的模型文件
+        policy_file = 'aquila/param_saved/trackVer17_policy.pkl'  # 使用Ver17的模型文件
         loaded_params, env_config = load_trained_policy(policy_file)
         train_state = TrainState.create(
             apply_fn=policy.apply,
@@ -163,7 +168,7 @@ def main():
     
     # ==================== TensorBoard Setup ====================
     # 创建tensorboard日志目录
-    log_dir = f'runs/trackVer16_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用Ver16的日志目录
+    log_dir = f'runs/trackVer17_{time.strftime("%Y%m%d_%H%M%S")}'  # 使用Ver17的日志目录
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard logs will be saved to: {log_dir}")
     print(f"Run 'tensorboard --logdir=runs' to view training progress")
@@ -176,7 +181,7 @@ def main():
     training_log = []
     
     print(f"\n{'='*60}")
-    print(f"开始训练追踪任务 (TrackVer16 - 基于Ver15，添加圆形轨迹支持)...")
+    print(f"开始训练追踪任务 (TrackVer17 - 简化版，只支持加减速直线运动)...")
     print(f"Total environments: {num_envs}")
     print(f"Number of epochs: {num_epochs}")
     print(f"Steps per epoch: {env.max_steps_in_episode}")
@@ -185,6 +190,7 @@ def main():
     print(f"Input dimension: {input_dim}")
     print(f"Network output: action + aux_target_vel (辅助损失)")
     print(f"Quadrotor model: Full (Quadrotor - based on agilicious framework)")
+    print(f"Ver17 new: 目标运动 = 加减速(正弦) + 随机恒定扰动")
     print(f"使用 bpttVer2 (scan 实现)")
     print(f"{'='*60}\n")
     
@@ -237,7 +243,7 @@ def main():
     writer.add_scalar('Config/action_obs_buffer_size', buffer_size, 0)
     writer.add_scalar('Config/input_dimension', input_dim, 0)
     writer.add_scalar('Config/effective_actions_per_epoch', env.max_steps_in_episode / action_repeat, 0)
-    writer.add_scalar('Config/auxiliary_loss', 1.0, 0)  # Ver16继承：辅助损失权重
+    writer.add_scalar('Config/auxiliary_loss', 1.0, 0)  # Ver17继承：辅助损失权重
     
     # 获取更新后的训练状态
     train_state = res_dict["runner_state"].train_state
@@ -245,7 +251,7 @@ def main():
     
     # ==================== Print Summary ====================
     print(f"\n{'='*60}")
-    print(f"追踪任务训练完成！(TrackVer16 - 基于Ver15，添加圆形轨迹支持)")
+    print(f"追踪任务训练完成！(TrackVer17 - 简化版，加减速直线运动)")
     print(f"{'='*60}")
     print(f"Training time: {training_time:.2f} seconds ({training_time/60:.2f} minutes)")
     print(f"Final Loss: {final_loss:.6f}")
@@ -257,6 +263,7 @@ def main():
     print(f"Effective actions per epoch: {env.max_steps_in_episode / action_repeat:.1f}")
     print(f"Network output: action + aux_target_vel (辅助损失)")
     print(f"Quadrotor model: Full (Quadrotor - based on agilicious framework)")
+    print(f"Ver17 new: 目标运动 = 加减速(正弦) + 随机恒定扰动")
     print(f"使用 bpttVer2 (scan 实现)")
     
     
@@ -276,7 +283,7 @@ def main():
             'dt': env.dt,
             'delay': env.delay,
             'action_penalty_weight': env.action_penalty_weight,
-            # Ver16 基于Ver15，添加圆形轨迹支持
+            # Ver17 简化版
             'target_height': env.target_height,
             'target_init_distance_min': env.target_init_distance_min,
             'target_init_distance_max': env.target_init_distance_max,
@@ -284,21 +291,24 @@ def main():
             'target_acceleration_max': env.target_acceleration_max,
             'reset_distance': env.reset_distance,
             'max_speed': env.max_speed,
+            # Ver17 info
+            'version': 'Ver17',
+            'target_motion': 'accel-decel + random perturbation',
         }
     }
     
     # 确保目录存在
-    os.makedirs('aquila/param', exist_ok=True)
+    os.makedirs('aquila/param_saved', exist_ok=True)
     
     # 保存最终权重为pickle文件
-    checkpoint_path = 'aquila/param/trackVer16_policy_final.pkl'  # 使用Ver16的文件名
+    checkpoint_path = 'aquila/param_saved/trackVer17_policy_final.pkl'  # 使用Ver17的文件名
     with open(checkpoint_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"\n✅ Final training policy saved as: {checkpoint_path}")
     
     # 额外保存一个带时间戳的备份
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = f'aquila/param/trackVer16_policy_{timestamp}.pkl'  # 使用Ver16的文件名
+    backup_path = f'aquila/param_saved/trackVer17_policy_{timestamp}.pkl'  # 使用Ver17的文件名
     with open(backup_path, 'wb') as f:
         pickle.dump(checkpoint_data, f)
     print(f"✅ Backup saved as: {backup_path}")
